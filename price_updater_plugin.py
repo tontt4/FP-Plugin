@@ -3,7 +3,6 @@ import json
 import time
 import requests
 import atexit
-import signal
 import threading
 from threading import Thread, Lock
 from typing import TYPE_CHECKING, Optional, Union
@@ -43,17 +42,13 @@ class Config:
     CACHE_TTL = 3600
     CYCLE_PAUSE = 300
     LOT_PROCESSING_DELAY = 2
-  
     LOTS_PER_PAGE = 8
-  
     STEAM_REQUEST_DELAY = 10
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 15
-  
     DEFAULT_STEAM_CURRENCY = "UAH"
     SUPPORTED_CURRENCIES = ["UAH", "KZT", "RUB", "USD", "EUR"]
     ACCOUNT_CURRENCIES = ["USD", "RUB", "EUR"]
-  
     MAX_CACHE_SIZE = 1000
 
 SETTINGS = {
@@ -73,6 +68,7 @@ SETTINGS = {
 LOTS = {}
 CARDINAL_INSTANCE = None
 WIZARD_STATES = {}
+
 class ThreadSafeCacheManager:
     def __init__(self, max_size: int = Config.MAX_CACHE_SIZE, ttl: int = Config.CACHE_TTL):
         self.cache = {}
@@ -111,14 +107,12 @@ class ThreadSafeCacheManager:
     def set(self, key: str, value):
         """Устанавливает значение в кеш"""
         with self._lock:
-        
             if len(self.cache) >= self.max_size:
                 try:
                     oldest_key = min(self.cache.keys(), 
                                    key=lambda k: self.cache[k]["timestamp"])
                     del self.cache[oldest_key]
                 except (ValueError, KeyError):
-                
                     pass
           
             self.cache[key] = {
@@ -174,6 +168,7 @@ class ThreadSafeCacheManager:
 # Единая система кеширования
 CACHE = ThreadSafeCacheManager()
 
+# Telegram callback константы
 CBT_CHANGE_CURRENCY = "SPU_change_curr"
 CBT_TEXT_CHANGE_LOT = "SPU_ChangeLot"
 CBT_TEXT_EDIT = "SPU_Edit"
@@ -187,20 +182,16 @@ CBT_EDIT_LOT = "SPU_edit_lot"
 CBT_TOGGLE_LOT = "SPU_toggle_lot"
 CBT_DELETE_LOT = "SPU_delete_lot"
 CBT_REFRESH_RATES = "SPU_refresh_rates"
-CBT_SWITCH_PRICE_TYPE = "SPU_switch_price_type"
 
 def get_currency_rate(currency: str = "USD") -> float:
     """
     Унифицированная функция для получения курса валют
-    ПРИОРИТЕТ: exchangerate-api для ВСЕХ валют включая UAH
     """
     currency = currency.upper()
-  
-
+    
     cache_key = f"{currency}_rate"
     cached_rate = CACHE.get(cache_key)
     if cached_rate and isinstance(cached_rate, dict):
-    
         cache_age = time.time() - cached_rate.get("timestamp", 0)
         if cache_age < 900:
             logger.debug(f"{LOGGER_PREFIX} Использую кеш для USD/{currency}: {cached_rate.get('rate')} (возраст: {int(cache_age/60)} мин)")
@@ -209,7 +200,6 @@ def get_currency_rate(currency: str = "USD") -> float:
             logger.debug(f"{LOGGER_PREFIX} Кеш USD/{currency} устарел ({int(cache_age/60)} мин), обновляю")
   
     try:
-    
         logger.debug(f"{LOGGER_PREFIX} Получаю курс USD/{currency} через exchangerate-api")
         url = "https://api.exchangerate-api.com/v4/latest/USD"
         response = requests.get(url, timeout=Config.REQUEST_TIMEOUT)
@@ -220,22 +210,18 @@ def get_currency_rate(currency: str = "USD") -> float:
           
             if currency in rates:
                 rate = float(rates[currency])
-              
-            
                 CACHE.set(cache_key, {
                     "rate": rate,
                     "timestamp": time.time(),
                     "source": "exchangerate-api"
                 })
-              
                 logger.info(f"{LOGGER_PREFIX} Получен СВЕЖИЙ курс USD/{currency}: {rate} (exchangerate-api)")
                 return rate
             else:
                 logger.warning(f"{LOGGER_PREFIX} Валюта {currency} не найдена в exchangerate-api")
         else:
             logger.warning(f"{LOGGER_PREFIX} exchangerate-api недоступен, статус: {response.status_code}")
-      
-    
+        
         logger.info(f"{LOGGER_PREFIX} Переход на резервный API для {currency}")
         return get_currency_fallback(currency)
       
@@ -243,15 +229,10 @@ def get_currency_rate(currency: str = "USD") -> float:
         logger.warning(f"{LOGGER_PREFIX} Ошибка получения курса USD/{currency}: {e}")
         return get_currency_fallback(currency)
 
-def get_usd_to_uah_rate() -> float:
-    """Получает курс USD к UAH - используется единый кеш через get_currency_rate"""
-    return get_currency_rate("UAH")
-
 def get_currency_fallback(currency: str) -> float:
     """Fallback API для получения курсов валют"""
     try:
         if currency == "RUB":
-        
             cbr_url = "https://www.cbr-xml-daily.ru/daily_json.js"
             response = requests.get(cbr_url, timeout=10)
             if response.status_code == 200:
@@ -264,21 +245,16 @@ def get_currency_fallback(currency: str) -> float:
                     return rate
       
         elif currency == "KZT":
-        
             try:
                 kz_url = "https://www.nationalbank.kz/rss/get_rates.cfm?fdate=" + time.strftime("%d.%m.%Y")
                 response = requests.get(kz_url, timeout=10)
                 if response.status_code == 200:
-                
-                    # xml.etree.ElementTree вже імпортовано вище
                     root = ET.fromstring(response.content)
                     for item in root.findall(".//item"):
                         title = item.find("title")
                         description = item.find("description")
                         if title is not None and "USD" in title.text:
                             rate_text = description.text if description is not None else ""
-                        
-                            # re вже імпортовано вище
                             rate_match = re.search(r'(\d+\.?\d*)', rate_text)
                             if rate_match:
                                 rate = float(rate_match.group(1))
@@ -289,7 +265,6 @@ def get_currency_fallback(currency: str) -> float:
                 logger.warning(f"{LOGGER_PREFIX} Ошибка API Казахстана: {e}")
       
         elif currency == "EUR":
-        
             try:
                 ecb_url = "https://api.exchangerate-api.com/v4/latest/USD"
                 response = requests.get(ecb_url, timeout=10)
@@ -297,7 +272,6 @@ def get_currency_fallback(currency: str) -> float:
                     data = response.json()
                     if "rates" in data and "EUR" in data["rates"]:
                         eur_to_usd = data["rates"]["EUR"]
-                    
                         rate = 1.0 / eur_to_usd
                         CACHE.set(f"{currency}_rate", {"rate": rate, "timestamp": time.time()})
                         logger.info(f"{LOGGER_PREFIX} Получен курс USD/EUR: {rate} (ECB)")
@@ -308,12 +282,10 @@ def get_currency_fallback(currency: str) -> float:
     except Exception as e:
         logger.warning(f"{LOGGER_PREFIX} Ошибка fallback API для {currency}: {e}")
   
-
     return get_fallback_rate(currency)
 
 def get_fallback_rate(currency: str) -> float:
     """Возвращает последние известные курсы из кеша или актуальные fallback курсы"""
-
     cache_key = f"{currency}_rate"
     cached_rate = CACHE.get_with_timestamp(cache_key)
   
@@ -324,7 +296,6 @@ def get_fallback_rate(currency: str) -> float:
             logger.warning(f"{LOGGER_PREFIX} Используем последний известный курс USD/{currency}: {rate} (возраст: {int(cache_age/3600)}ч {int((cache_age%3600)/60)}м)")
             return rate
   
-
     fallback_rates = {
         "UAH": 41.82,
         "RUB": 78.42,
@@ -335,10 +306,6 @@ def get_fallback_rate(currency: str) -> float:
     rate = fallback_rates.get(currency, 1.0)
     logger.warning(f"{LOGGER_PREFIX} Используем экстренный fallback курс USD/{currency}: {rate}")
     return rate
-
-def get_usd_rate() -> float:
-    """Получает актуальный курс доллара - алиас для get_currency_rate('USD')"""
-    return get_currency_rate("USD")
 
 def clear_currency_cache():
     """Принудительно очищает кеш курсов валют"""
@@ -361,7 +328,6 @@ def clear_currency_cache():
 
 def validate_steam_id(steam_id: str) -> tuple[bool, str, str]:
     """
-
     Возвращает: (is_valid, id_type, clean_id)
     """
     if not steam_id or not str(steam_id).strip():
@@ -369,7 +335,6 @@ def validate_steam_id(steam_id: str) -> tuple[bool, str, str]:
   
     steam_id = str(steam_id).strip()
   
-
     if steam_id.startswith("sub_"):
         try:
             sub_id_num = steam_id[4:]
@@ -388,7 +353,6 @@ def validate_steam_id(steam_id: str) -> tuple[bool, str, str]:
 
 def get_steam_price(steam_id: str, currency_code: str = "UAH") -> Optional[float]:
     """
-
     """
 
     is_valid, id_type, clean_id = validate_steam_id(steam_id)
@@ -569,24 +533,11 @@ def calculate_lot_price(steam_price: Union[float, int, str], steam_currency: str
         logger.error(f"{LOGGER_PREFIX} Ошибка расчета цены: {e}")
         return 0.0
 
-def safe_cache_operation(operation_name: str):
-    """Декоратор для безопасных операций с кешем"""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                logger.warning(f"{LOGGER_PREFIX} Ошибка {operation_name}: {e}")
-                return None
-        return wrapper
-    return decorator
-
 def cleanup_resources():
     """Очистка ресурсов при завершении"""
     try:
         logger.info(f"{LOGGER_PREFIX} Очистка ресурсов")
         CACHE.clear_expired()
-    
     except Exception as e:
         logger.error(f"{LOGGER_PREFIX} Ошибка очистки ресурсов: {e}")
 
@@ -596,10 +547,84 @@ def check_cardinal_health() -> bool:
     try:
         if not CARDINAL_INSTANCE:
             return False
-    
         return hasattr(CARDINAL_INSTANCE, 'account') and CARDINAL_INSTANCE.account is not None
     except Exception:
         return False
+
+def save_data_to_file(data, filename_base, data_type="данные"):
+    """Универсальная функция сохранения данных в JSON"""
+    try:
+        json_data = json.dumps(data, indent=4, ensure_ascii=False)
+        logger.debug(f"{LOGGER_PREFIX} Сериализованы {data_type}. Размер: {len(json_data)} символов")
+      
+        save_attempts = [
+            f"storage/plugins/{filename_base}.json",
+            f"{filename_base}.json",
+            f"/tmp/{filename_base}.json"
+        ]
+      
+        for attempt_file in save_attempts:
+            try:
+                dir_path = os.path.dirname(attempt_file)
+                if dir_path and not os.path.exists(dir_path):
+                    os.makedirs(dir_path, exist_ok=True)
+              
+                with open(attempt_file, "w", encoding="utf-8") as f:
+                    f.write(json_data)
+                    f.flush()
+                    os.fsync(f.fileno()) if hasattr(os, 'fsync') else None
+              
+                if os.path.exists(attempt_file):
+                    file_size = os.path.getsize(attempt_file)
+                    logger.info(f"{LOGGER_PREFIX} ✅ {data_type.title()} сохранены в {attempt_file} ({file_size} байт)")
+                    return True
+              
+            except (PermissionError, OSError, IOError) as e:
+                logger.debug(f"{LOGGER_PREFIX} Попытка {attempt_file} неудачна: {e}")
+                continue
+      
+        # Экстренное сохранение
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp_file:
+                tmp_file.write(json_data)
+                logger.warning(f"{LOGGER_PREFIX} ⚠️ Экстренное сохранение {data_type} в {tmp_file.name}")
+                return True
+        except Exception as e:
+            logger.error(f"{LOGGER_PREFIX} ❌ Экстренное сохранение {data_type} не удалось: {e}")
+            return False
+          
+    except Exception as e:
+        logger.error(f"{LOGGER_PREFIX} ❌ Критическая ошибка сохранения {data_type}: {e}")
+        return False
+
+def load_data_from_file(filename_base, default_data, data_type="данные"):
+    """Универсальная функция загрузки данных из JSON"""
+    try:
+        load_attempts = [
+            f"storage/plugins/{filename_base}.json",
+            f"{filename_base}.json",
+            f"/tmp/{filename_base}.json"
+        ]
+      
+        for attempt_file in load_attempts:
+            if os.path.exists(attempt_file):
+                try:
+                    with open(attempt_file, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                        if content:
+                            data = json.loads(content)
+                            logger.info(f"{LOGGER_PREFIX} Загружены {data_type} из {attempt_file}: {len(data) if isinstance(data, (dict, list)) else 'данные'}")
+                            return data
+                except Exception as e:
+                    logger.warning(f"{LOGGER_PREFIX} Ошибка чтения {attempt_file}: {e}")
+                    continue
+      
+        logger.info(f"{LOGGER_PREFIX} Файлы {data_type} не найдены, используем значения по умолчанию")
+        return default_data
+      
+    except Exception as e:
+        logger.error(f"{LOGGER_PREFIX} Критическая ошибка загрузки {data_type}: {e}")
+        return default_data
 
 def validate_lot_data(lot_data: dict) -> bool:
     """Валидирует данные лота"""
@@ -849,99 +874,16 @@ def init(cardinal: Cardinal):
     logger.info(f"{LOGGER_PREFIX} Инициализация Telegram хэндлеров...")
 
     def save_settings():
-        try:
-        
-            import os
-            os.makedirs("storage/plugins", exist_ok=True)
-          
-            with open("storage/plugins/steam_price_updater.json", "w", encoding="utf-8") as f:
-                f.write(json.dumps(SETTINGS, indent=4, ensure_ascii=False))
-            logger.info(f"{LOGGER_PREFIX} Настройки сохранены.")
-        except Exception as e:
-            logger.error(f"{LOGGER_PREFIX} Ошибка сохранения настроек: {e}")
-
-    def save_data_to_file(data, filename_base, data_type="данные"):
-        """Універсальна функція збереження даних в JSON"""
-        try:
-            json_data = json.dumps(data, indent=4, ensure_ascii=False)
-            logger.debug(f"{LOGGER_PREFIX} Сериализованы {data_type}. Размер: {len(json_data)} символов")
-          
-            save_attempts = [
-                f"storage/plugins/{filename_base}.json",
-                f"{filename_base}.json",
-                f"/tmp/{filename_base}.json"
-            ]
-          
-            for attempt_file in save_attempts:
-                try:
-                    dir_path = os.path.dirname(attempt_file)
-                    if dir_path and not os.path.exists(dir_path):
-                        os.makedirs(dir_path, exist_ok=True)
-                  
-                    with open(attempt_file, "w", encoding="utf-8") as f:
-                        f.write(json_data)
-                        f.flush()
-                        os.fsync(f.fileno()) if hasattr(os, 'fsync') else None
-                  
-                    if os.path.exists(attempt_file):
-                        file_size = os.path.getsize(attempt_file)
-                        logger.info(f"{LOGGER_PREFIX} ✅ {data_type.title()} сохранены в {attempt_file} ({file_size} байт)")
-                        return True
-                  
-                except (PermissionError, OSError, IOError) as e:
-                    logger.debug(f"{LOGGER_PREFIX} Попытка {attempt_file} неудачна: {e}")
-                    continue
-          
-            # Экстренное сохранение
-            try:
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp_file:
-                    tmp_file.write(json_data)
-                    logger.warning(f"{LOGGER_PREFIX} ⚠️ Экстренное сохранение {data_type} в {tmp_file.name}")
-                    return True
-            except Exception as e:
-                logger.error(f"{LOGGER_PREFIX} ❌ Экстренное сохранение {data_type} не удалось: {e}")
-                return False
-              
-        except Exception as e:
-            logger.error(f"{LOGGER_PREFIX} ❌ Критическая ошибка сохранения {data_type}: {e}")
-            return False
+        """Сохраняет настройки плагина"""
+        return save_data_to_file(SETTINGS, "steam_price_updater", "настройки")
 
     def save_lots():
-        """Збереження лотів з використанням універсальної функції"""
+        """Сохраняет лоты"""
         return save_data_to_file(LOTS, "steam_price_updater_lots", "лоты")
 
     def save_wizard_states():
         """Сохраняет состояния мастера в файл"""
-        save_data_to_file(WIZARD_STATES, "steam_price_updater_wizard", "состояния мастера")
-
-    def load_data_from_file(filename_base, default_data, data_type="данные"):
-        """Універсальна функція завантаження даних з JSON"""
-        try:
-            load_attempts = [
-                f"storage/plugins/{filename_base}.json",
-                f"{filename_base}.json",
-                f"/tmp/{filename_base}.json"
-            ]
-          
-            for attempt_file in load_attempts:
-                if os.path.exists(attempt_file):
-                    try:
-                        with open(attempt_file, "r", encoding="utf-8") as f:
-                            content = f.read().strip()
-                            if content:
-                                data = json.loads(content)
-                                logger.info(f"{LOGGER_PREFIX} Загружены {data_type} из {attempt_file}: {len(data) if isinstance(data, (dict, list)) else 'данные'}")
-                                return data
-                    except Exception as e:
-                        logger.warning(f"{LOGGER_PREFIX} Ошибка чтения {attempt_file}: {e}")
-                        continue
-          
-            logger.info(f"{LOGGER_PREFIX} Файлы {data_type} не найдены, используем значения по умолчанию")
-            return default_data
-          
-        except Exception as e:
-            logger.error(f"{LOGGER_PREFIX} Критическая ошибка загрузки {data_type}: {e}")
-            return default_data
+        return save_data_to_file(WIZARD_STATES, "steam_price_updater_wizard", "состояния мастера")
 
     def load_wizard_states():
         """Загружает состояния мастера из файла"""
@@ -1205,116 +1147,9 @@ def init(cardinal: Cardinal):
             logger.error(f"{LOGGER_PREFIX} Ошибка в switch_steam_currency: {e}")
             bot.answer_callback_query(call.id, "❌ Ошибка")
 
-    def wizard_step2_steam_id(message, lot_id):
-        """Мастер - Шаг 2: Steam ID"""
-        text = "🧙‍♂️ <b>Мастер добавления лота</b>\n\n"
-        text += "📋 <b>Шаг 2 из 4: Steam ID</b>\n\n"
-        text += f"✅ ID лота: <code>{lot_id}</code>\n\n"
-        text += "Введите Steam ID игры:\n"
-        text += "• <b>App ID</b> (обычная игра): просто цифры, например <code>730</code>\n"
-        text += "• <b>Sub ID</b> (DLC/Package): <code>sub_12345</code>\n\n"
-        text += "🔍 Найти можно:\n"
-        text += "• SteamDB.info\n"
-        text += "• Steam URL игры\n"
-        text += "• Например: CS2 = <code>730</code>"
-      
-        keyboard = K()
-        keyboard.add(B("◀ К лотам", callback_data=f"{CBT_LOTS_MENU}:0"))
-      
-        msg = bot.send_message(message.chat.id, text, reply_markup=keyboard, parse_mode="HTML")
-        tg.set_state(message.chat.id, msg.message_id, message.from_user.id, 
-                    "lot_wizard", {"step": "steam_id", "lot_id": lot_id})
 
-    def wizard_step3_currency(message, lot_id, steam_id):
-        """Мастер - Шаг 3: Валюта Steam"""
-        text = "🧙‍♂️ <b>Мастер добавления лота</b>\n\n"
-        text += "📋 <b>Шаг 3 из 4: Валюта Steam</b>\n\n"
-        text += f"✅ ID лота: <code>{lot_id}</code>\n"
-        text += f"✅ Steam ID: <code>{steam_id}</code>\n\n"
-        text += "Выберите валюту для получения цен Steam:"
-      
-        keyboard = K()
-        keyboard.row(
-            B("🇺🇦 UAH", callback_data=f"wizard_currency:{lot_id}:{steam_id}:UAH"),
-            B("🇺🇸 USD", callback_data=f"wizard_currency:{lot_id}:{steam_id}:USD")
-        )
-        keyboard.row(
-            B("🇷🇺 RUB", callback_data=f"wizard_currency:{lot_id}:{steam_id}:RUB"),
-            B("🇰🇿 KZT", callback_data=f"wizard_currency:{lot_id}:{steam_id}:KZT")
-        )
-        keyboard.add(B("◀ К лотам", callback_data=f"{CBT_LOTS_MENU}:0"))
-      
-        tg.clear_state(message.chat.id, message.from_user.id)
-        bot.send_message(message.chat.id, text, reply_markup=keyboard, parse_mode="HTML")
 
-    def wizard_step4_max_price(message, lot_id, steam_id, steam_currency, min_price):
-        """Мастер - Шаг 4: Максимальная цена"""
-        text = "🧙‍♂️ <b>Мастер добавления лота</b>\n\n"
-        text += "📋 <b>Шаг 4 из 4: Максимальная цена</b>\n\n"
-        text += f"✅ ID лота: <code>{lot_id}</code>\n"
-        text += f"✅ Steam ID: <code>{steam_id}</code>\n"
-        text += f"✅ Валюта: {steam_currency}\n"
-        text += f"✅ Мин. цена: ${min_price}\n\n"
-        text += f"Введите максимальную цену (больше {min_price}):"
-      
-        keyboard = K()
-        keyboard.add(B("◀ К лотам", callback_data=f"{CBT_LOTS_MENU}:0"))
-      
-        msg = bot.send_message(message.chat.id, text, reply_markup=keyboard, parse_mode="HTML")
-        tg.set_state(message.chat.id, msg.message_id, message.from_user.id, 
-                    "lot_wizard", {
-                        "step": "max_price", 
-                        "lot_id": lot_id,
-                        "steam_id": steam_id,
-                        "steam_currency": steam_currency,
-                        "min_price": min_price
-                    })
 
-    def wizard_complete(message, lot_id, steam_id, steam_currency, min_price, max_price):
-        """Завершение мастера - создание лота"""
-        global LOTS
-      
-        logger.info(f"{LOGGER_PREFIX} === ЗАВЕРШЕНИЕ МАСТЕРА ===")
-        logger.info(f"{LOGGER_PREFIX} Lot ID: {lot_id}")
-        logger.info(f"{LOGGER_PREFIX} Steam ID: {steam_id}")
-        logger.info(f"{LOGGER_PREFIX} Currency: {steam_currency}")
-        logger.info(f"{LOGGER_PREFIX} Price range: {min_price} - {max_price}")
-      
-    
-        LOTS[lot_id] = {
-            "on": True,
-            "steam_id": steam_id,
-            "steam_app_id": 0,
-            "steam_currency": steam_currency,
-            "min": min_price,
-            "max": max_price,
-            "last_steam_price": 0,
-            "last_price": 0,
-            "last_update": 0
-        }
-      
-        logger.info(f"{LOGGER_PREFIX} Сохранен Steam ID: {steam_id}")
-      
-        logger.info(f"{LOGGER_PREFIX} Лот создан в памяти. Всего лотов: {len(LOTS)}")
-        logger.info(f"{LOGGER_PREFIX} Сохраняем лоты...")
-        save_lots()
-        tg.clear_state(message.chat.id, message.from_user.id)
-      
-    
-        global_interval_hours = SETTINGS['time'] // 3600
-      
-        text = "🎉 <b>Лот успешно создан!</b>\n\n"
-        text += f"📦 ID лота: <code>{lot_id}</code>\n"
-        text += f"🎮 Steam ID: <code>{steam_id}</code>\n" 
-        text += f"💱 Валюта: {steam_currency}\n"
-        text += f"💰 Цены: ${min_price} - ${max_price}\n"
-        text += f"✅ Статус: <b>Включен</b>\n\n"
-        text += f"⏰ Лот будет обновляться каждые <b>{global_interval_hours} ч</b>"
-      
-        keyboard = K()
-        keyboard.add(B("📦 К лотам", callback_data=f"{CBT_LOTS_MENU}:0"))
-      
-        bot.send_message(message.chat.id, text, reply_markup=keyboard, parse_mode="HTML")
 
     def start_lot_wizard(call: telebot.types.CallbackQuery):
         """Мастер добавления лота - Шаг 1: ID лота"""
@@ -1628,30 +1463,25 @@ def init(cardinal: Cardinal):
           
             active_lots = [lot for lot in LOTS.values() if lot.get("on", False)]
             lots_with_prices = len([l for l in LOTS.values() if l.get("last_price", 0) > 0])
-            cache_hits = len(steam_price_cache)
+            cache_size = len(CACHE)
           
             text = f"📊 Статистика Steam Price Updater\n\n"
             text += f"📦 Всего лотов: {len(LOTS)}\n"
             text += f"✅ Активных: {len(active_lots)}\n"
             text += f"💰 Лотов с ценами: {lots_with_prices}\n"
-            text += f"🔄 Кеш Steam: {cache_hits} записей\n"
+            text += f"🔄 Кеш: {cache_size} записей\n"
           
-        
             try:
                 uah_rate = get_currency_rate("UAH")
+                rub_rate = get_currency_rate("RUB")
+                kzt_rate = get_currency_rate("KZT")
+                
                 text += f"💱 USD/UAH: {uah_rate:.2f}\n"
-              
-                rub_cached = CACHE.get("currency_rate_RUB")
-                kzt_cached = CACHE.get("currency_rate_KZT")
-              
-                if rub_cached:
-                    text += f"💱 USD/RUB: {rub_cached['rate']:.2f}\n"
-                if kzt_cached:
-                    text += f"💱 USD/KZT: {kzt_cached['rate']:.2f}\n"
+                text += f"💱 USD/RUB: {rub_rate:.2f}\n"
+                text += f"💱 USD/KZT: {kzt_rate:.2f}\n"
             except:
                 text += f"💱 Курсы валют: загрузка...\n"
           
-        
             recent_updates = [lot for lot in LOTS.values() if lot.get("last_update", 0) > 0]
             if recent_updates:
                 last_update_time = max(lot.get("last_update", 0) for lot in recent_updates)
@@ -2077,59 +1907,28 @@ def init(cardinal: Cardinal):
                         bot.reply_to(message, f"❌ Лот {lot_id} уже настроен")
                         return
                   
-                
-                    wizard_step2_steam_id(message, lot_id)
+                    # Перехід до кроку 2 вже обробляється в handle_wizard_input
+                    user_key = f"{message.chat.id}_{message.from_user.id}"
+                    WIZARD_STATES[user_key] = {"step": "steam_id", "lot_id": lot_id}
+                    
+                    text_msg = "🧙‍♂️ <b>Мастер добавления лота</b>\n\n"
+                    text_msg += "📋 <b>Шаг 2 из 4: Steam ID</b>\n\n"
+                    text_msg += f"✅ ID лота: <code>{lot_id}</code>\n\n"
+                    text_msg += "Введите Steam ID игры:\n"
+                    text_msg += "• Для обычных игр: <code>730</code> (CS2)\n"
+                    text_msg += "• Для DLC: <code>sub_12345</code>\n"
+                    text_msg += "• Найти можно на steamdb.info"
+                  
+                    keyboard = K()
+                    keyboard.add(B("◀ К лотам", callback_data=f"{CBT_LOTS_MENU}:0"))
+                  
+                    bot.send_message(message.chat.id, text_msg, reply_markup=keyboard, parse_mode="HTML")
                     return
                   
-                elif step == "steam_id":
-                
-                    lot_id = data.get("lot_id")
-                    steam_id = text.strip()
-                  
-                
-                    is_valid, id_type, clean_id = validate_steam_id(steam_id)
-                    if not is_valid:
-                        bot.reply_to(message, f"❌ Неверный формат Steam ID. {clean_id}")
-                        return
-                  
-                
-                    wizard_step3_currency(message, lot_id, clean_id)
+                else:
+                    # Перенаправляем на новую логику мастера
+                    handle_wizard_input(message, data)
                     return
-                  
-                elif step == "min_price":
-                
-                    lot_id = data.get("lot_id")
-                    steam_id = data.get("steam_id")
-                    steam_currency = data.get("steam_currency")
-                  
-                    try:
-                        min_price = float(text)
-                        if min_price <= 0:
-                            bot.reply_to(message, "❌ Цена должна быть больше 0")
-                            return
-                        wizard_step4_max_price(message, lot_id, steam_id, steam_currency, min_price)
-                        return
-                    except ValueError:
-                        bot.reply_to(message, "❌ Введите корректную цену (число)")
-                        return
-                      
-                elif step == "max_price":
-                
-                    lot_id = data.get("lot_id")
-                    steam_id = data.get("steam_id")
-                    steam_currency = data.get("steam_currency")
-                    min_price = data.get("min_price")
-                  
-                    try:
-                        max_price = float(text)
-                        if max_price <= min_price:
-                            bot.reply_to(message, f"❌ Максимальная цена должна быть больше минимальной ({min_price})")
-                            return
-                        wizard_complete(message, lot_id, steam_id, steam_currency, min_price, max_price)
-                        return
-                    except ValueError:
-                        bot.reply_to(message, "❌ Введите корректную цену (число)")
-                        return
           
         
             if n == "settings":
@@ -2326,10 +2125,14 @@ def init(cardinal: Cardinal):
                 bot.answer_callback_query(call.id, "❌ Ошибка данных")
                 return
               
-            currency = call.data.split(':')[1]
+            parts = call.data.split(':')
+            if len(parts) < 2:
+                bot.answer_callback_query(call.id, "❌ Неверный формат данных")
+                return
+                
+            currency = parts[1]
             user_key = f"{call.message.chat.id}_{call.from_user.id}"
           
-        
             if user_key not in WIZARD_STATES:
                 bot.answer_callback_query(call.id, "❌ Сессия истекла")
                 return
@@ -2343,7 +2146,6 @@ def init(cardinal: Cardinal):
                 bot.answer_callback_query(call.id, "❌ Ошибка данных")
                 return
               
-        
             WIZARD_STATES[user_key] = {
                 "step": "max_price",
                 "lot_id": lot_id,
@@ -2357,7 +2159,7 @@ def init(cardinal: Cardinal):
             text += f"✅ ID лота: <code>{lot_id}</code>\n"
             text += f"✅ Steam ID: <code>{steam_id}</code>\n"
             text += f"✅ Валюта: <code>{currency}</code>\n"
-            text += f"✅ Мин. цена: <code>{min_price:.2f} {SETTINGS['account_currency']}</code>\n\n"
+            text += f"✅ Мин. цена: <code>{min_price:.2f} {SETTINGS['currency']}</code>\n\n"
             text += f"Введите максимальную цену (больше {min_price:.2f}):"
           
             keyboard = K()
@@ -2371,9 +2173,6 @@ def init(cardinal: Cardinal):
             bot.answer_callback_query(call.id, "❌ Ошибка")
   
     tg.cbq_handler(wizard_currency_selected, lambda c: c.data and c.data.startswith("wizard_currency:"))
-  
-
-    WIZARD_STATES = {}
   
     def wizard_message_handler(message: telebot.types.Message):
         """Обработчик сообщений для мастера с собственным хранением состояний"""
@@ -2533,7 +2332,6 @@ def init(cardinal: Cardinal):
                 bot.send_message(message.chat.id, text_msg, reply_markup=keyboard, parse_mode="HTML")
               
             elif step == "max_price":
-            
                 lot_id = state_data.get("lot_id")
                 steam_id = state_data.get("steam_id")
                 steam_currency = state_data.get("steam_currency")
@@ -2548,37 +2346,37 @@ def init(cardinal: Cardinal):
                     bot.reply_to(message, "❌ Введите корректную цену (например: 100.50)")
                     return
               
-            
-                lot_data = {
+                # Создаем лот с правильными полями
+                LOTS[lot_id] = {
+                    "on": True,
                     "steam_id": steam_id,
+                    "steam_app_id": 0,
                     "steam_currency": steam_currency,
-                    "min_price": min_price,
-                    "max_price": max_price,
-                    "enabled": True,
-                    "last_update": 0,
-                    "last_price": 0
+                    "min": min_price,
+                    "max": max_price,
+                    "last_steam_price": 0,
+                    "last_price": 0,
+                    "last_update": 0
                 }
               
-                LOTS[lot_id] = lot_data
                 save_lots()
               
-            
+                # Очищаем состояние мастера
                 if user_key in WIZARD_STATES:
                     del WIZARD_STATES[user_key]
               
-            
                 global_interval_hours = SETTINGS['time'] // 3600
               
                 text_msg = "✅ <b>Лот успешно добавлен!</b>\n\n"
                 text_msg += f"📦 ID лота: <code>{lot_id}</code>\n"
                 text_msg += f"🎮 Steam ID: <code>{steam_id}</code>\n"
-                text_msg += f"💰 Диапазон цен: {min_price:.2f} - {max_price:.2f} {SETTINGS['account_currency']}\n"
+                text_msg += f"💰 Диапазон цен: {min_price:.2f} - {max_price:.2f} {SETTINGS['currency']}\n"
                 text_msg += f"🌍 Валюта Steam: {steam_currency}\n\n"
                 text_msg += f"⏰ Лот будет автоматически обновляться каждые <b>{global_interval_hours} ч</b>"
               
                 keyboard = K()
                 keyboard.add(B("📦 К лотам", callback_data=f"{CBT_LOTS_MENU}:0"))
-                keyboard.add(B("🔄 Обновить сейчас", callback_data=f"update_single:{lot_id}"))
+                keyboard.add(B("🔄 Обновить сейчас", callback_data=f"update_single_lot:{lot_id}"))
               
                 bot.send_message(message.chat.id, text_msg, reply_markup=keyboard, parse_mode="HTML")
               
