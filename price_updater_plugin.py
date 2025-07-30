@@ -1648,22 +1648,19 @@ def init(cardinal):
           
             def refresh_thread():
                 try:
-                
                     global CACHE
-                  
-                
+                    
+                    # Очищаем кеш валют
                     cleared_count = clear_currency_cache()
-                  
-                
+                    
+                    # Дополнительная очистка кеша валют (на всякий случай)
                     try:
-                        currency_keys = [k for k in CACHE.keys() if k.startswith("currency_rate_")]
+                        currency_keys = [k for k in CACHE.cache.keys() if k.startswith("currency_rate_")]
                         for key in currency_keys:
                             if key in CACHE.cache:
                                 del CACHE.cache[key]
                     except Exception:
                         pass
-                  
-                    usd_rate_cache["timestamp"] = 0
                   
                 
                     uah_rate = get_currency_rate("UAH")
