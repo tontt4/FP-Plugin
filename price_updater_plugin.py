@@ -6,7 +6,7 @@ import atexit
 import signal
 import threading
 from threading import Thread, Lock
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, Dict, Any, Tuple
 from datetime import datetime as dt
 import os
 
@@ -39,17 +39,13 @@ class Config:
     CACHE_TTL = 3600
     CYCLE_PAUSE = 300
     LOT_PROCESSING_DELAY = 2
-  
     LOTS_PER_PAGE = 8
-  
     STEAM_REQUEST_DELAY = 10
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 15
-  
     DEFAULT_STEAM_CURRENCY = "UAH"
     SUPPORTED_CURRENCIES = ["UAH", "KZT", "RUB", "USD", "EUR"]
     ACCOUNT_CURRENCIES = ["USD", "RUB", "EUR"]
-  
     MAX_CACHE_SIZE = 1000
 
 SETTINGS = {
@@ -69,14 +65,16 @@ SETTINGS = {
 LOTS = {}
 CARDINAL_INSTANCE = None
 WIZARD_STATES = {}
-class ThreadSafeCacheManager:
+
+class UnifiedCacheManager:
+    """Единый менеджер кеша для всех типов данных"""
     def __init__(self, max_size: int = Config.MAX_CACHE_SIZE, ttl: int = Config.CACHE_TTL):
         self.cache = {}
         self.max_size = max_size
         self.ttl = ttl
         self._lock = Lock()
   
-    def get(self, key: str):
+    def get(self, key: str, default=None):
         """Возвращает значение из кеша с проверкой TTL"""
         with self._lock:
             if key in self.cache:
@@ -84,76 +82,43 @@ class ThreadSafeCacheManager:
                 if time.time() - entry["timestamp"] < self.ttl:
                     return entry["value"]
                 else:
-                    try:
-                        del self.cache[key]
-                    except KeyError:
-                        pass
-            return None
+                    self._remove_key(key)
+            return default
   
-    def get_with_timestamp(self, key: str):
-        """Возвращает полный объект кеша с timestamp"""
-        with self._lock:
-            if key in self.cache:
-                entry = self.cache[key]
-                if time.time() - entry["timestamp"] < self.ttl:
-                    return entry["value"]
-                else:
-                    try:
-                        del self.cache[key]
-                    except KeyError:
-                        pass
-            return None
-  
-    def set(self, key: str, value):
+    def set(self, key: str, value: Any):
         """Устанавливает значение в кеш"""
         with self._lock:
-        
             if len(self.cache) >= self.max_size:
-                try:
-                    oldest_key = min(self.cache.keys(), 
-                                   key=lambda k: self.cache[k]["timestamp"])
-                    del self.cache[oldest_key]
-                except (ValueError, KeyError):
-                
-                    pass
-          
+                self._evict_oldest()
+            
             self.cache[key] = {
                 "value": value,
                 "timestamp": time.time()
             }
   
-    def __contains__(self, key):
-        """Поддержка оператора 'in'"""
-        return self.get(key) is not None
+    def _remove_key(self, key: str):
+        """Безопасно удаляет ключ"""
+        try:
+            del self.cache[key]
+        except KeyError:
+            pass
   
-    def __getitem__(self, key):
-        """Поддержка получения значения через []"""
-        value = self.get(key)
-        if value is None:
-            raise KeyError(key)
-        return value
+    def _evict_oldest(self):
+        """Удаляет самую старую запись"""
+        try:
+            oldest_key = min(self.cache.keys(), 
+                           key=lambda k: self.cache[k]["timestamp"])
+            self._remove_key(oldest_key)
+        except (ValueError, KeyError):
+            pass
   
-    def __setitem__(self, key, value):
-        """Поддержка установки значения через []"""
-        self.set(key, value)
-  
-    def __len__(self):
-        """Поддержка len()"""
+    def clear_by_pattern(self, pattern: str) -> int:
+        """Очищает записи по паттерну"""
         with self._lock:
-            return len(self.cache)
-  
-    def keys(self):
-        """Возвращает ключи"""
-        with self._lock:
-            return list(self.cache.keys())
-  
-    def __delitem__(self, key):
-        """Поддержка удаления через del cache[key]"""
-        with self._lock:
-            if key in self.cache:
-                del self.cache[key]
-            else:
-                raise KeyError(key)
+            keys_to_remove = [k for k in self.cache.keys() if pattern in k]
+            for key in keys_to_remove:
+                self._remove_key(key)
+            return len(keys_to_remove)
   
     def clear_expired(self):
         """Очищает устаревшие записи"""
@@ -162,18 +127,12 @@ class ThreadSafeCacheManager:
             expired_keys = [k for k, v in self.cache.items() 
                            if current_time - v["timestamp"] >= self.ttl]
             for key in expired_keys:
-                try:
-                    del self.cache[key]
-                except KeyError:
-                    pass
+                self._remove_key(key)
 
-steam_price_cache = {}
-usd_rate_cache = {"rate": 0.0, "timestamp": 0.0, "cache_duration": float(Config.CACHE_TTL)}
-CACHE = ThreadSafeCacheManager()
+# Единый экземпляр кеша
+CACHE = UnifiedCacheManager()
 
-steam_price_cache_lock = Lock()
-usd_rate_cache_lock = Lock()
-
+# Константы для callback кнопок
 CBT_CHANGE_CURRENCY = "SPU_change_curr"
 CBT_TEXT_CHANGE_LOT = "SPU_ChangeLot"
 CBT_TEXT_EDIT = "SPU_Edit"
@@ -189,424 +148,8 @@ CBT_DELETE_LOT = "SPU_delete_lot"
 CBT_REFRESH_RATES = "SPU_refresh_rates"
 CBT_SWITCH_PRICE_TYPE = "SPU_switch_price_type"
 
-def get_currency_rate(currency: str = "USD") -> float:
-    """
-    Унифицированная функция для получения курса валют
-    ПРИОРИТЕТ: exchangerate-api для ВСЕХ валют включая UAH
-    """
-    currency = currency.upper()
-  
-
-    cache_key = f"{currency}_rate"
-    cached_rate = CACHE.get(cache_key)
-    if cached_rate and isinstance(cached_rate, dict):
-    
-        cache_age = time.time() - cached_rate.get("timestamp", 0)
-        if cache_age < 900:
-            logger.debug(f"{LOGGER_PREFIX} Использую кеш для USD/{currency}: {cached_rate.get('rate')} (возраст: {int(cache_age/60)} мин)")
-            return cached_rate.get("rate", get_fallback_rate(currency))
-        else:
-            logger.debug(f"{LOGGER_PREFIX} Кеш USD/{currency} устарел ({int(cache_age/60)} мин), обновляю")
-  
-    try:
-    
-        logger.debug(f"{LOGGER_PREFIX} Получаю курс USD/{currency} через exchangerate-api")
-        url = "https://api.exchangerate-api.com/v4/latest/USD"
-        response = requests.get(url, timeout=Config.REQUEST_TIMEOUT)
-      
-        if response.status_code == 200:
-            data = response.json()
-            rates = data.get("rates", {})
-          
-            if currency in rates:
-                rate = float(rates[currency])
-              
-            
-                CACHE.set(cache_key, {
-                    "rate": rate,
-                    "timestamp": time.time(),
-                    "source": "exchangerate-api"
-                })
-              
-                logger.info(f"{LOGGER_PREFIX} Получен СВЕЖИЙ курс USD/{currency}: {rate} (exchangerate-api)")
-                return rate
-            else:
-                logger.warning(f"{LOGGER_PREFIX} Валюта {currency} не найдена в exchangerate-api")
-        else:
-            logger.warning(f"{LOGGER_PREFIX} exchangerate-api недоступен, статус: {response.status_code}")
-      
-    
-        logger.info(f"{LOGGER_PREFIX} Переход на резервный API для {currency}")
-        return get_currency_fallback(currency)
-      
-    except Exception as e:
-        logger.warning(f"{LOGGER_PREFIX} Ошибка получения курса USD/{currency}: {e}")
-        return get_currency_fallback(currency)
-
-def get_usd_to_uah_rate() -> float:
-    """Получает курс USD к UAH из НБУ"""
-    with usd_rate_cache_lock:
-        current_time = time.time()
-      
-    
-        if (current_time - usd_rate_cache["timestamp"] < usd_rate_cache["cache_duration"] 
-            and usd_rate_cache["rate"] > 0):
-            return usd_rate_cache["rate"]
-      
-        try:
-        
-            nbu_url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=USD&json"
-            response = requests.get(nbu_url, timeout=SETTINGS["request_timeout"])
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, list) and len(data) > 0:
-                    rate = float(data[0]["rate"])
-                    usd_rate_cache["rate"] = float(rate)
-                    usd_rate_cache["timestamp"] = float(current_time)
-                    logger.info(f"{LOGGER_PREFIX} Получен курс USD/UAH: {rate} (НБУ)")
-                    return rate
-        except Exception as e:
-            logger.warning(f"{LOGGER_PREFIX} Ошибка НБУ API: {e}")
-      
-      
-        return usd_rate_cache.get("rate", 41.5)
-
-def get_currency_fallback(currency: str) -> float:
-    """Fallback API для получения курсов валют"""
-    try:
-        if currency == "RUB":
-        
-            cbr_url = "https://www.cbr-xml-daily.ru/daily_json.js"
-            response = requests.get(cbr_url, timeout=10)
-            if response.status_code == 200:
-                cbr_data = response.json()
-                usd_data = cbr_data.get("Valute", {}).get("USD", {})
-                if usd_data:
-                    rate = float(usd_data["Value"])
-                    CACHE.set(f"{currency}_rate", {"rate": rate, "timestamp": time.time()})
-                    logger.info(f"{LOGGER_PREFIX} Получен курс USD/RUB: {rate} (ЦБ РФ)")
-                    return rate
-      
-        elif currency == "KZT":
-        
-            try:
-                kz_url = "https://www.nationalbank.kz/rss/get_rates.cfm?fdate=" + time.strftime("%d.%m.%Y")
-                response = requests.get(kz_url, timeout=10)
-                if response.status_code == 200:
-                
-                    import xml.etree.ElementTree as ET
-                    root = ET.fromstring(response.content)
-                    for item in root.findall(".//item"):
-                        title = item.find("title")
-                        description = item.find("description")
-                        if title is not None and "USD" in title.text:
-                            rate_text = description.text if description is not None else ""
-                        
-                            import re
-                            rate_match = re.search(r'(\d+\.?\d*)', rate_text)
-                            if rate_match:
-                                rate = float(rate_match.group(1))
-                                CACHE.set(f"{currency}_rate", {"rate": rate, "timestamp": time.time()})
-                                logger.info(f"{LOGGER_PREFIX} Получен курс USD/KZT: {rate} (Нацбанк КЗ)")
-                                return rate
-            except Exception as e:
-                logger.warning(f"{LOGGER_PREFIX} Ошибка API Казахстана: {e}")
-      
-        elif currency == "EUR":
-        
-            try:
-                ecb_url = "https://api.exchangerate-api.com/v4/latest/USD"
-                response = requests.get(ecb_url, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    if "rates" in data and "EUR" in data["rates"]:
-                        eur_to_usd = data["rates"]["EUR"]
-                    
-                        rate = 1.0 / eur_to_usd
-                        CACHE.set(f"{currency}_rate", {"rate": rate, "timestamp": time.time()})
-                        logger.info(f"{LOGGER_PREFIX} Получен курс USD/EUR: {rate} (ECB)")
-                        return rate
-            except Exception as e:
-                logger.warning(f"{LOGGER_PREFIX} Ошибка API EUR: {e}")
-              
-    except Exception as e:
-        logger.warning(f"{LOGGER_PREFIX} Ошибка fallback API для {currency}: {e}")
-  
-
-    return get_fallback_rate(currency)
-
-def get_fallback_rate(currency: str) -> float:
-    """Возвращает последние известные курсы из кеша или актуальные fallback курсы"""
-
-    cache_key = f"{currency}_rate"
-    cached_rate = CACHE.get_with_timestamp(cache_key)
-  
-    if cached_rate and isinstance(cached_rate, dict):
-        rate = cached_rate.get("rate")
-        if rate and rate > 0:
-            cache_age = time.time() - cached_rate.get("timestamp", 0)
-            logger.warning(f"{LOGGER_PREFIX} Используем последний известный курс USD/{currency}: {rate} (возраст: {int(cache_age/3600)}ч {int((cache_age%3600)/60)}м)")
-            return rate
-  
-
-    fallback_rates = {
-        "UAH": 41.82,
-        "RUB": 78.42,
-        "KZT": 519.86, 
-        "EUR": 0.85, 
-        "USD": 1.0
-    }
-    rate = fallback_rates.get(currency, 1.0)
-    logger.warning(f"{LOGGER_PREFIX} Используем экстренный fallback курс USD/{currency}: {rate}")
-    return rate
-
-def get_usd_rate() -> float:
-    """Получает актуальный курс доллара - алиас для get_currency_rate('USD')"""
-    return get_currency_rate("USD")
-
-def clear_currency_cache():
-    """Принудительно очищает кеш курсов валют"""
-    global CACHE
-    try:
-    
-        currencies = ["USD", "UAH", "RUB", "EUR", "KZT"]
-        cleared_count = 0
-      
-        for currency in currencies:
-            cache_key = f"{currency}_rate"
-            if cache_key in CACHE.cache:
-                del CACHE.cache[cache_key]
-                cleared_count += 1
-      
-        logger.info(f"{LOGGER_PREFIX} Очищен кеш курсов валют: {cleared_count} записей")
-        return cleared_count
-    except Exception as e:
-        logger.error(f"{LOGGER_PREFIX} Ошибка очистки кеша валют: {e}")
-        return 0
-
-def validate_steam_id(steam_id: str) -> tuple[bool, str, str]:
-    """
-
-    Возвращает: (is_valid, id_type, clean_id)
-    """
-    if not steam_id or not str(steam_id).strip():
-        return False, "", ""
-  
-    steam_id = str(steam_id).strip()
-  
-
-    if steam_id.startswith("sub_"):
-        try:
-            sub_id_num = steam_id[4:]
-            if sub_id_num.isdigit() and len(sub_id_num) > 0:
-                return True, "sub", sub_id_num
-            else:
-                return False, "", ""
-        except:
-            return False, "", ""
-    else:
-    
-        if steam_id.isdigit() and len(steam_id) > 0:
-            return True, "app", steam_id
-        else:
-            return False, "", ""
-
-def get_steam_price(steam_id: str, currency_code: str = "UAH") -> Optional[float]:
-    """
-
-    """
-
-    is_valid, id_type, clean_id = validate_steam_id(steam_id)
-    if not is_valid:
-        logger.warning(f"{LOGGER_PREFIX} Неверный формат Steam ID: {steam_id}")
-        return None
-  
-
-    currency_map = {
-        "UAH": "ua",
-        "KZT": "kz",
-        "RUB": "ru",
-        "USD": "us" 
-    }
-  
-    cc_code = currency_map.get(currency_code, "ua")
-  
-
-    cache_key = f"steam_price_{steam_id}_{currency_code}"
-    with steam_price_cache_lock:
-        if cache_key in steam_price_cache:
-            cached_data = steam_price_cache[cache_key]
-            if time.time() - cached_data["timestamp"] < 3600:
-                logger.debug(f"{LOGGER_PREFIX} Кешированная цена для Steam {steam_id} ({currency_code})")
-                return cached_data["price"]
-  
-    try:
-        time.sleep(SETTINGS["steam_request_delay"])
-      
-    
-        if id_type == "sub":
-        
-            url = f"https://store.steampowered.com/api/packagedetails/?packageids={clean_id}&cc={cc_code}"
-            response = requests.get(url, timeout=SETTINGS["request_timeout"])
-          
-            if response.status_code == 200:
-                data = response.json()
-                package_data = data.get(str(clean_id))
-              
-                if package_data and package_data.get("success"):
-                    price_overview = package_data.get("data", {}).get("price")
-                  
-                    if price_overview:
-                        final_price = price_overview.get("final", 0)
-                      
-                        if final_price > 0:
-                            price_value = final_price / 100.0
-                          
-                        
-                            with steam_price_cache_lock:
-                                steam_price_cache[cache_key] = {
-                                    "price": price_value,
-                                    "timestamp": time.time()
-                                }
-                            logger.debug(f"{LOGGER_PREFIX} Steam цена для Sub ID {steam_id}: {price_value} {currency_code}")
-                            return price_value
-                    else:
-                    
-                        with steam_price_cache_lock:
-                            steam_price_cache[cache_key] = {"price": 0.0, "timestamp": time.time()}
-                        return 0.0
-        else:
-        
-            url = f"https://store.steampowered.com/api/appdetails/?appids={clean_id}&cc={cc_code}&filters=price_overview"
-            response = requests.get(url, timeout=SETTINGS["request_timeout"])
-          
-            if response.status_code == 200:
-                data = response.json()
-                app_data = data.get(str(clean_id))
-              
-                if app_data and app_data.get("success"):
-                    price_overview = app_data.get("data", {}).get("price_overview")
-                  
-                    if price_overview:
-                        final_price = price_overview.get("final", 0)
-                      
-                        if final_price > 0:
-                            price_value = final_price / 100.0
-                          
-                        
-                            with steam_price_cache_lock:
-                                steam_price_cache[cache_key] = {
-                                    "price": price_value,
-                                    "timestamp": time.time()
-                                }
-                            logger.debug(f"{LOGGER_PREFIX} Steam цена для App ID {steam_id}: {price_value} {currency_code}")
-                            return price_value
-                    else:
-                    
-                        with steam_price_cache_lock:
-                            steam_price_cache[cache_key] = {"price": 0.0, "timestamp": time.time()}
-                        return 0.0
-      
-        return None
-      
-    except Exception as e:
-        logger.warning(f"{LOGGER_PREFIX} Ошибка получения Steam цены для {steam_id} ({currency_code}): {e}")
-        return None
-
-def calculate_lot_price(steam_price: Union[float, int, str], steam_currency: str = "UAH") -> float:
-    """
-    Вычисляет цену лота с учетом валюты FunPay аккаунта
-  
-    Логика наценки:
-    - 3% наценка на валютный курс
-    - 5% маржа прибыли
-    - 0.5 единицы валюты фиксированная наценка (для дешевых игр)
-    """
-
-    try:
-        if isinstance(steam_price, str):
-            steam_price = float(steam_price)
-        elif not isinstance(steam_price, (int, float)):
-            logger.warning(f"{LOGGER_PREFIX} Неверный тип данных для steam_price: {type(steam_price)}")
-            return 0.0
-      
-        steam_price = float(steam_price)
-        if steam_price < 0:
-            logger.warning(f"{LOGGER_PREFIX} Отрицательная цена Steam: {steam_price}")
-            return 0.0
-          
-    except (ValueError, TypeError) as e:
-        logger.warning(f"{LOGGER_PREFIX} Ошибка преобразования steam_price: {e}")
-        return 0.0
-  
-
-    if steam_price <= 0.01:
-        return SETTINGS["min_price"]
-  
-    try:
-    
-        account_currency = SETTINGS.get("currency", "USD")
-      
-    
-        if steam_currency == account_currency:
-        
-            base_price = steam_price
-        else:
-        
-            if account_currency == "USD":
-            
-                if steam_currency == "USD":
-                    base_price = steam_price
-                else:
-                    currency_rate = get_currency_rate(steam_currency)
-                    if currency_rate <= 0:
-                        logger.warning(f"{LOGGER_PREFIX} Неверный курс валюты: {currency_rate}")
-                        return 0.0
-                    base_price = steam_price / currency_rate
-            else:
-            
-                if steam_currency == "USD":
-                    price_usd = steam_price
-                else:
-                    steam_rate = get_currency_rate(steam_currency)
-                    if steam_rate <= 0:
-                        logger.warning(f"{LOGGER_PREFIX} Неверный курс Steam валюты: {steam_rate}")
-                        return 0.0
-                    price_usd = steam_price / steam_rate
-              
-            
-                account_rate = get_currency_rate(account_currency)
-                if account_rate <= 0:
-                    logger.warning(f"{LOGGER_PREFIX} Неверный курс валюты аккаунта: {account_rate}")
-                    return 0.0
-                base_price = price_usd * account_rate
-      
-    
-        price_with_currency_markup = base_price * (1 + SETTINGS["first_markup"] / 100)
-      
-    
-        final_price = price_with_currency_markup * (1 + SETTINGS["second_markup"] / 100) + SETTINGS["fixed_markup"]
-      
-    
-        final_price = min(final_price, SETTINGS["max_price"])
-        final_price = max(final_price, SETTINGS["min_price"])
-      
-    
-        final_price = round(final_price, 2)
-      
-    
-        currency_symbol = {"USD": "$", "RUB": "₽", "EUR": "€"}.get(account_currency, account_currency)
-      
-        logger.debug(f"{LOGGER_PREFIX} Расчет цены: {steam_price} {steam_currency} → {base_price:.4f} {account_currency} → +3% курс → {price_with_currency_markup:.4f} → +5% маржа + {SETTINGS['fixed_markup']} → {currency_symbol}{final_price:.2f}")
-      
-        return final_price
-      
-    except Exception as e:
-        logger.error(f"{LOGGER_PREFIX} Ошибка расчета цены: {e}")
-        return 0.0
-
-def safe_cache_operation(operation_name: str):
-    """Декоратор для безопасных операций с кешем"""
+def safe_file_operation(operation_name: str):
+    """Декоратор для безопасных операций с файлами"""
     def decorator(func):
         def wrapper(*args, **kwargs):
             try:
@@ -617,145 +160,413 @@ def safe_cache_operation(operation_name: str):
         return wrapper
     return decorator
 
+@safe_file_operation("сохранения файла")
+def save_to_file(data: Dict, filename: str, description: str = "") -> bool:
+    """Универсальная функция сохранения данных в файл"""
+    save_attempts = [
+        f"storage/plugins/{filename}",
+        filename,
+        f"/tmp/{filename}",
+        f"./{filename.replace('.json', '_backup.json')}"
+    ]
+    
+    json_data = json.dumps(data, indent=4, ensure_ascii=False)
+    
+    for attempt_file in save_attempts:
+        try:
+            # Создаем директорию если нужно
+            dir_path = os.path.dirname(attempt_file)
+            if dir_path and not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
+            
+            with open(attempt_file, 'w', encoding='utf-8') as f:
+                f.write(json_data)
+                f.flush()
+                
+                try:
+                    os.fsync(f.fileno())
+                except (OSError, AttributeError):
+                    pass
+            
+            if os.path.exists(attempt_file):
+                file_size = os.path.getsize(attempt_file)
+                logger.info(f"{LOGGER_PREFIX} {description} сохранены в {attempt_file} (размер: {file_size} байт)")
+                return True
+                
+        except (PermissionError, OSError, IOError) as e:
+            logger.warning(f"{LOGGER_PREFIX} Не удалось сохранить в {attempt_file}: {e}")
+            continue
+    
+    logger.error(f"{LOGGER_PREFIX} Не удалось сохранить {description}")
+    return False
+
+@safe_file_operation("загрузки файла")
+def load_from_file(filename: str, default_data: Dict = None) -> Dict:
+    """Универсальная функция загрузки данных из файла"""
+    if default_data is None:
+        default_data = {}
+        
+    load_attempts = [
+        f"storage/plugins/{filename}",
+        filename,
+        f"/tmp/{filename}",
+        f"./{filename.replace('.json', '_backup.json')}"
+    ]
+    
+    for attempt_file in load_attempts:
+        if os.path.exists(attempt_file):
+            try:
+                with open(attempt_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    if content.strip():
+                        return json.loads(content)
+            except (json.JSONDecodeError, Exception) as e:
+                logger.warning(f"{LOGGER_PREFIX} Ошибка при чтении {attempt_file}: {e}")
+                continue
+    
+    return default_data
+
+def get_currency_rate(currency: str = "USD") -> float:
+    """Унифицированная функция для получения курса валют"""
+    currency = currency.upper()
+    
+    if currency == "USD":
+        return 1.0
+    
+    cache_key = f"currency_rate_{currency}"
+    cached_rate = CACHE.get(cache_key)
+    
+    if cached_rate and isinstance(cached_rate, dict):
+        cache_age = time.time() - cached_rate.get("timestamp", 0)
+        if cache_age < 900:  # 15 минут
+            logger.debug(f"{LOGGER_PREFIX} Использую кеш для USD/{currency}: {cached_rate.get('rate')} (возраст: {int(cache_age/60)} мин)")
+            return cached_rate.get("rate", _get_fallback_rate(currency))
+    
+    try:
+        # Основной API - exchangerate-api
+        logger.debug(f"{LOGGER_PREFIX} Получаю курс USD/{currency} через exchangerate-api")
+        url = "https://api.exchangerate-api.com/v4/latest/USD"
+        response = requests.get(url, timeout=Config.REQUEST_TIMEOUT)
+        
+        if response.status_code == 200:
+            data = response.json()
+            rates = data.get("rates", {})
+            
+            if currency in rates:
+                rate = float(rates[currency])
+                
+                CACHE.set(cache_key, {
+                    "rate": rate,
+                    "timestamp": time.time(),
+                    "source": "exchangerate-api"
+                })
+                
+                logger.info(f"{LOGGER_PREFIX} Получен курс USD/{currency}: {rate} (exchangerate-api)")
+                return rate
+        
+        # Fallback API
+        return _get_currency_fallback(currency)
+        
+    except Exception as e:
+        logger.warning(f"{LOGGER_PREFIX} Ошибка получения курса USD/{currency}: {e}")
+        return _get_currency_fallback(currency)
+
+def _get_currency_fallback(currency: str) -> float:
+    """Резервные API для получения курсов валют"""
+    cache_key = f"currency_rate_{currency}"
+    
+    try:
+        if currency == "RUB":
+            cbr_url = "https://www.cbr-xml-daily.ru/daily_json.js"
+            response = requests.get(cbr_url, timeout=10)
+            if response.status_code == 200:
+                cbr_data = response.json()
+                usd_data = cbr_data.get("Valute", {}).get("USD", {})
+                if usd_data:
+                    rate = float(usd_data["Value"])
+                    CACHE.set(cache_key, {"rate": rate, "timestamp": time.time(), "source": "cbr"})
+                    logger.info(f"{LOGGER_PREFIX} Получен курс USD/RUB: {rate} (ЦБ РФ)")
+                    return rate
+        
+        elif currency == "UAH":
+            nbu_url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=USD&json"
+            response = requests.get(nbu_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    rate = float(data[0]["rate"])
+                    CACHE.set(cache_key, {"rate": rate, "timestamp": time.time(), "source": "nbu"})
+                    logger.info(f"{LOGGER_PREFIX} Получен курс USD/UAH: {rate} (НБУ)")
+                    return rate
+                    
+    except Exception as e:
+        logger.warning(f"{LOGGER_PREFIX} Ошибка fallback API для {currency}: {e}")
+    
+    return _get_fallback_rate(currency)
+
+def _get_fallback_rate(currency: str) -> float:
+    """Возвращает последние известные курсы из кеша или статические fallback курсы"""
+    cache_key = f"currency_rate_{currency}"
+    cached_rate = CACHE.get(cache_key)
+    
+    if cached_rate and isinstance(cached_rate, dict):
+        rate = cached_rate.get("rate")
+        if rate and rate > 0:
+            cache_age = time.time() - cached_rate.get("timestamp", 0)
+            logger.warning(f"{LOGGER_PREFIX} Используем последний известный курс USD/{currency}: {rate} (возраст: {int(cache_age/3600)}ч)")
+            return rate
+    
+    # Статические fallback курсы
+    fallback_rates = {
+        "UAH": 41.82,
+        "RUB": 78.42,
+        "KZT": 519.86,
+        "EUR": 0.85,
+        "USD": 1.0
+    }
+    
+    rate = fallback_rates.get(currency, 1.0)
+    logger.warning(f"{LOGGER_PREFIX} Используем экстренный fallback курс USD/{currency}: {rate}")
+    return rate
+
+def clear_currency_cache() -> int:
+    """Принудительно очищает кеш курсов валют"""
+    return CACHE.clear_by_pattern("currency_rate_")
+
+def validate_steam_id(steam_id: str) -> Tuple[bool, str, str]:
+    """Валидирует Steam ID и возвращает (is_valid, id_type, clean_id)"""
+    if not steam_id or not str(steam_id).strip():
+        return False, "", "Пустой Steam ID"
+    
+    steam_id = str(steam_id).strip()
+    
+    # Sub ID (DLC/Package)
+    if steam_id.startswith("sub_"):
+        try:
+            sub_id_num = steam_id[4:]
+            if sub_id_num.isdigit() and len(sub_id_num) > 0:
+                return True, "sub", sub_id_num
+            else:
+                return False, "", "Неверный формат Sub ID. Используйте: sub_123456"
+        except:
+            return False, "", "Ошибка обработки Sub ID"
+    
+    # App ID (обычная игра)
+    elif steam_id.isdigit() and len(steam_id) > 0:
+        return True, "app", steam_id
+    else:
+        return False, "", "Steam ID должен содержать только цифры или формат sub_123456"
+
+def get_steam_price(steam_id: str, currency_code: str = "UAH") -> Optional[float]:
+    """Получает цену игры из Steam API"""
+    is_valid, id_type, clean_id = validate_steam_id(steam_id)
+    if not is_valid:
+        logger.warning(f"{LOGGER_PREFIX} Неверный формат Steam ID: {steam_id}")
+        return None
+    
+    # Маппинг валют
+    currency_map = {
+        "UAH": "ua",
+        "KZT": "kz", 
+        "RUB": "ru",
+        "USD": "us",
+        "EUR": "eu"
+    }
+    
+    cc_code = currency_map.get(currency_code, "ua")
+    cache_key = f"steam_price_{steam_id}_{currency_code}"
+    
+    # Проверяем кеш
+    cached_price = CACHE.get(cache_key)
+    if cached_price is not None:
+        logger.debug(f"{LOGGER_PREFIX} Кешированная цена для Steam {steam_id} ({currency_code}): {cached_price}")
+        return cached_price
+    
+    try:
+        time.sleep(SETTINGS["steam_request_delay"])
+        
+        if id_type == "sub":
+            url = f"https://store.steampowered.com/api/packagedetails/?packageids={clean_id}&cc={cc_code}"
+        else:
+            url = f"https://store.steampowered.com/api/appdetails/?appids={clean_id}&cc={cc_code}&filters=price_overview"
+        
+        response = requests.get(url, timeout=SETTINGS["request_timeout"])
+        
+        if response.status_code == 200:
+            data = response.json()
+            item_data = data.get(str(clean_id))
+            
+            if item_data and item_data.get("success"):
+                if id_type == "sub":
+                    price_info = item_data.get("data", {}).get("price")
+                else:
+                    price_info = item_data.get("data", {}).get("price_overview")
+                
+                if price_info:
+                    final_price = price_info.get("final", 0)
+                    if final_price > 0:
+                        price_value = final_price / 100.0
+                        CACHE.set(cache_key, price_value)
+                        logger.debug(f"{LOGGER_PREFIX} Steam цена для {id_type.upper()} ID {steam_id}: {price_value} {currency_code}")
+                        return price_value
+                
+                # Бесплатная игра/DLC
+                CACHE.set(cache_key, 0.0)
+                return 0.0
+        
+        return None
+        
+    except Exception as e:
+        logger.warning(f"{LOGGER_PREFIX} Ошибка получения Steam цены для {steam_id} ({currency_code}): {e}")
+        return None
+
+def calculate_lot_price(steam_price: Union[float, int, str], steam_currency: str = "UAH") -> float:
+    """Вычисляет цену лота с учетом валюты FunPay аккаунта"""
+    try:
+        steam_price = float(steam_price)
+        if steam_price <= 0.01:
+            return SETTINGS["min_price"]
+    except (ValueError, TypeError) as e:
+        logger.warning(f"{LOGGER_PREFIX} Ошибка преобразования steam_price: {e}")
+        return 0.0
+    
+    try:
+        account_currency = SETTINGS.get("currency", "USD")
+        
+        # Конвертируем цену в валюту аккаунта
+        if steam_currency == account_currency:
+            base_price = steam_price
+        else:
+            if account_currency == "USD":
+                if steam_currency == "USD":
+                    base_price = steam_price
+                else:
+                    currency_rate = get_currency_rate(steam_currency)
+                    if currency_rate <= 0:
+                        return 0.0
+                    base_price = steam_price / currency_rate
+            else:
+                # Конвертируем через USD
+                if steam_currency == "USD":
+                    price_usd = steam_price
+                else:
+                    steam_rate = get_currency_rate(steam_currency)
+                    if steam_rate <= 0:
+                        return 0.0
+                    price_usd = steam_price / steam_rate
+                
+                account_rate = get_currency_rate(account_currency)
+                if account_rate <= 0:
+                    return 0.0
+                base_price = price_usd * account_rate
+        
+        # Применяем наценки
+        price_with_currency_markup = base_price * (1 + SETTINGS["first_markup"] / 100)
+        final_price = price_with_currency_markup * (1 + SETTINGS["second_markup"] / 100) + SETTINGS["fixed_markup"]
+        
+        # Ограничиваем цену
+        final_price = min(final_price, SETTINGS["max_price"])
+        final_price = max(final_price, SETTINGS["min_price"])
+        
+        return round(final_price, 2)
+        
+    except Exception as e:
+        logger.error(f"{LOGGER_PREFIX} Ошибка расчета цены: {e}")
+        return 0.0
+
 def cleanup_resources():
     """Очистка ресурсов при завершении"""
     try:
         logger.info(f"{LOGGER_PREFIX} Очистка ресурсов")
         CACHE.clear_expired()
-    
     except Exception as e:
         logger.error(f"{LOGGER_PREFIX} Ошибка очистки ресурсов: {e}")
 
 def check_cardinal_health() -> bool:
     """Проверяет доступность Cardinal"""
-    global CARDINAL_INSTANCE
     try:
-        if not CARDINAL_INSTANCE:
-            return False
-    
-        return hasattr(CARDINAL_INSTANCE, 'account') and CARDINAL_INSTANCE.account is not None
+        return (CARDINAL_INSTANCE is not None and 
+                hasattr(CARDINAL_INSTANCE, 'account') and 
+                CARDINAL_INSTANCE.account is not None)
     except Exception:
         return False
 
 def validate_lot_data(lot_data: dict) -> bool:
     """Валидирует данные лота"""
     required_fields = ["steam_id", "steam_currency", "min", "max"]
-  
-
-    missing_fields = []
+    
+    # Проверяем наличие полей
     for field in required_fields:
         if field not in lot_data:
-            missing_fields.append(field)
-  
-    if missing_fields:
-        logger.debug(f"{LOGGER_PREFIX} Отсутствующие поля в lot_data: {missing_fields}")
-        logger.debug(f"{LOGGER_PREFIX} Доступные поля: {list(lot_data.keys())}")
-        return False
-  
-
+            logger.debug(f"{LOGGER_PREFIX} Отсутствует поле: {field}")
+            return False
+    
+    # Валидируем Steam ID
     steam_id = lot_data.get("steam_id")
     if not steam_id or steam_id == "":
-        logger.debug(f"{LOGGER_PREFIX} Пустой steam_id: '{steam_id}'")
+        logger.debug(f"{LOGGER_PREFIX} Пустой steam_id")
         return False
-  
+    
+    # Валидируем цены
     min_price = lot_data.get("min")
     max_price = lot_data.get("max")
-    if not isinstance(min_price, (int, float)) or not isinstance(max_price, (int, float)):
-        logger.debug(f"{LOGGER_PREFIX} Неверный тип цен: min={min_price} ({type(min_price)}), max={max_price} ({type(max_price)})")
+    if (not isinstance(min_price, (int, float)) or 
+        not isinstance(max_price, (int, float)) or
+        min_price <= 0 or max_price <= 0 or min_price > max_price):
+        logger.debug(f"{LOGGER_PREFIX} Неверные цены: min={min_price}, max={max_price}")
         return False
-  
-    if min_price <= 0 or max_price <= 0:
-        logger.debug(f"{LOGGER_PREFIX} Отрицательные цены: min={min_price}, max={max_price}")
-        return False
-  
-    if min_price > max_price:
-        logger.debug(f"{LOGGER_PREFIX} min больше max: min={min_price}, max={max_price}")
-        return False
-  
+    
     return True
 
-def get_lot_name(lot_data) -> str:
-    """Получает название лота из Steam API с поддержкой App ID и Sub ID"""
-
-    steam_id = lot_data.get("steam_id")
-    if not steam_id:
-      
-        steam_app_id = lot_data.get("steam_app_id")
-        if not steam_app_id:
-            return "Неизвестная игра"
-        steam_id = str(steam_app_id)
-  
+def get_lot_name(lot_data: dict) -> str:
+    """Получает название лота из Steam API"""
+    steam_id = lot_data.get("steam_id") or str(lot_data.get("steam_app_id", ""))
     if not steam_id:
         return "Неизвестная игра"
-  
-    cache_key = f"game_name_{steam_id}"
-  
-
-    cached_data = CACHE.get(cache_key)
-    if cached_data:
     
-        return cached_data["name"]
-  
+    cache_key = f"game_name_{steam_id}"
+    cached_name = CACHE.get(cache_key)
+    if cached_name:
+        return cached_name
+    
     try:
         is_sub_id = str(steam_id).startswith("sub_")
-      
-        if is_sub_id:
         
+        if is_sub_id:
             sub_id = str(steam_id)[4:]
             url = f"https://store.steampowered.com/api/packagedetails"
             params = {"packageids": sub_id, "filters": "basic"}
-            response = requests.get(url, params=params, timeout=10)
-          
-            if response.status_code == 200:
-                data = response.json()
-                package_data = data.get(str(sub_id), {})
-                if package_data.get("success") and "data" in package_data:
-                    name = package_data["data"].get("name", f"Sub {steam_id}")
-                    CACHE.set(cache_key, {"name": name, "timestamp": time.time()})
-                    return name
         else:
-        
             url = f"https://store.steampowered.com/api/appdetails"
             params = {"appids": steam_id, "filters": "basic"}
-            response = requests.get(url, params=params, timeout=10)
-          
-            if response.status_code == 200:
-                data = response.json()
-                app_data = data.get(str(steam_id), {})
-                if app_data.get("success") and "data" in app_data:
-                    name = app_data["data"].get("name", f"App {steam_id}")
-                    CACHE.set(cache_key, {"name": name, "timestamp": time.time()})
-                    return name
+        
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            item_data = data.get(str(sub_id if is_sub_id else steam_id), {})
+            if item_data.get("success") and "data" in item_data:
+                name = item_data["data"].get("name", f"Steam {steam_id}")
+                CACHE.set(cache_key, name)
+                return name
+                
     except Exception as e:
         logger.debug(f"{LOGGER_PREFIX} Ошибка получения названия игры {steam_id}: {e}")
-  
+    
     return f"Steam {steam_id}"
 
 def update_lot_price(lot_id: str, lot_data: dict, cardinal) -> bool:
-    """Обновляет цену одного лота с полной валидацией и retry механизмом"""
+    """Обновляет цену одного лота"""
     try:
-    
-        logger.debug(f"{LOGGER_PREFIX} Обновление лота {lot_id}: получены данные {lot_data}")
-      
-    
-        validation_result = validate_lot_data(lot_data)
-        if not validation_result:
+        # Валидация данных
+        if not validate_lot_data(lot_data):
             logger.warning(f"{LOGGER_PREFIX} Невалидные данные лота {lot_id}")
-            logger.warning(f"{LOGGER_PREFIX} Полученные данные: {lot_data}")
-        
-            logger.warning(f"{LOGGER_PREFIX} ВНИМАНИЕ: Валидация отключена для отладки")
-        else:
-            logger.debug(f"{LOGGER_PREFIX} Валидация лота {lot_id} пройдена успешно")
-      
-    
-        steam_id = lot_data.get("steam_id") or str(lot_data.get("steam_app_id", ""))
-        if not steam_id or steam_id == "0":
-            logger.warning(f"{LOGGER_PREFIX} Отсутствует Steam ID для лота {lot_id}")
             return False
-      
+        
+        steam_id = lot_data.get("steam_id")
         steam_currency = lot_data.get("steam_currency", Config.DEFAULT_STEAM_CURRENCY)
-      
-    
+        
+        # Получаем цену Steam с retry
         steam_price = None
         for attempt in range(Config.MAX_RETRIES):
             steam_price = get_steam_price(steam_id, steam_currency)
@@ -763,143 +574,79 @@ def update_lot_price(lot_id: str, lot_data: dict, cardinal) -> bool:
                 break
             if attempt < Config.MAX_RETRIES - 1:
                 time.sleep(Config.LOT_PROCESSING_DELAY)
-      
+        
         if not steam_price or steam_price <= 0:
             logger.warning(f"{LOGGER_PREFIX} Не удалось получить цену Steam для лота {lot_id}")
             return False
-      
-    
+        
+        # Вычисляем новую цену
         new_price = calculate_lot_price(steam_price, steam_currency)
         if new_price <= 0:
-            logger.error(f"{LOGGER_PREFIX} Неверная вычисленная цена для лота {lot_id}: {new_price}")
             return False
-      
-    
+        
+        # Применяем ограничения лота
         lot_min = lot_data.get("min", SETTINGS["min_price"])
         lot_max = lot_data.get("max", SETTINGS["max_price"])
         new_price = max(lot_min, min(new_price, lot_max))
-      
-    
+        
+        # Обновляем цену
         success = change_price(cardinal, lot_id, new_price)
         if success:
             LOTS[lot_id]["last_steam_price"] = steam_price
             LOTS[lot_id]["last_update"] = time.time()
-            logger.info(f"{LOGGER_PREFIX} Лот {lot_id} успешно обновлен: Steam {steam_price} {steam_currency} → ${new_price:.2f}")
-      
+            logger.info(f"{LOGGER_PREFIX} Лот {lot_id} обновлен: Steam {steam_price} {steam_currency} → ${new_price:.2f}")
+        
         return success
-      
+        
     except Exception as e:
         logger.error(f"{LOGGER_PREFIX} Ошибка обновления лота {lot_id}: {e}")
         return False
 
-def change_price(cardinal: Cardinal, my_lot_id: str, new_price: float) -> bool:
+def change_price(cardinal, my_lot_id: str, new_price: float) -> bool:
     """Изменяет цену лота"""
     try:
-        logger.debug(f"{LOGGER_PREFIX} Попытка изменить цену лота {my_lot_id} на {new_price}")
-      
-    
         if my_lot_id not in LOTS:
-            logger.warning(f"{LOGGER_PREFIX} Лот {my_lot_id} не найден в списке добавленных лотов (всего лотов: {len(LOTS)})")
-            logger.debug(f"{LOGGER_PREFIX} Доступные лоты: {list(LOTS.keys())}")
+            logger.warning(f"{LOGGER_PREFIX} Лот {my_lot_id} не найден в списке")
             return False
-      
-    
+        
+        # Получаем поля лота
         try:
             lot_fields = cardinal.account.get_lot_fields(int(my_lot_id))
             time.sleep(0.5)
         except Exception as api_error:
             logger.error(f"{LOGGER_PREFIX} Ошибка API при получении лота {my_lot_id}: {api_error}")
-        
+            
+            # Удаляем недоступный лот
             if "не найден" in str(api_error).lower() or "not found" in str(api_error).lower():
-                logger.warning(f"{LOGGER_PREFIX} Удаляю недоступный лот {my_lot_id} из списка")
                 if my_lot_id in LOTS:
                     del LOTS[my_lot_id]
-                
-                    try:
-                        import json
-                        import os
-                        json_data = json.dumps(LOTS, indent=4, ensure_ascii=False)
-                      
-                    
-                        save_attempts = [
-                            "storage/plugins/steam_price_updater_lots.json",
-                            "steam_price_updater_lots.json",
-                            "/tmp/steam_price_updater_lots.json"
-                        ]
-                      
-                        saved = False
-                        for attempt_file in save_attempts:
-                            try:
-                            
-                                if "/" in attempt_file:
-                                    dir_path = os.path.dirname(attempt_file)
-                                    if dir_path and not os.path.exists(dir_path):
-                                        os.makedirs(dir_path, exist_ok=True)
-                              
-                                with open(attempt_file, 'w', encoding='utf-8') as f:
-                                    f.write(json_data)
-                                    f.flush()
-                              
-                                logger.info(f"{LOGGER_PREFIX} Список лотов сохранен в {attempt_file}")
-                                saved = True
-                                break
-                            except (PermissionError, OSError, IOError):
-                                continue
-                      
-                        if not saved:
-                            logger.error(f"{LOGGER_PREFIX} Не удалось сохранить обновленный список лотов")
-                          
-                    except Exception as save_error:
-                        logger.error(f"{LOGGER_PREFIX} Ошибка сохранения списка лотов: {save_error}")
+                    save_to_file(LOTS, "steam_price_updater_lots.json", "обновленный список лотов")
             return False
-      
-        if lot_fields is None:
-            logger.error(f"{LOGGER_PREFIX} Не удалось получить поля лота {my_lot_id} - лот может быть удален или недоступен")
         
-            logger.warning(f"{LOGGER_PREFIX} Удаляю недоступный лот {my_lot_id} из списка")
+        if lot_fields is None or not hasattr(lot_fields, 'price'):
+            logger.error(f"{LOGGER_PREFIX} Лот {my_lot_id} недоступен или не имеет цены")
             if my_lot_id in LOTS:
                 del LOTS[my_lot_id]
-            
-                try:
-                    import json
-                    import os
-                    lots_file = "storage/plugins/steam_price_updater_lots.json"
-                    os.makedirs(os.path.dirname(lots_file), exist_ok=True)
-                    with open(lots_file, 'w', encoding='utf-8') as f:
-                        json.dump(LOTS, f, ensure_ascii=False, indent=4)
-                    logger.info(f"{LOGGER_PREFIX} Список лотов обновлен")
-                except Exception as save_error:
-                    logger.error(f"{LOGGER_PREFIX} Ошибка сохранения списка лотов: {save_error}")
+                save_to_file(LOTS, "steam_price_updater_lots.json", "обновленный список лотов")
             return False
-          
-    
-        if not hasattr(lot_fields, 'price'):
-            logger.error(f"{LOGGER_PREFIX} У лота {my_lot_id} нет атрибута price")
-            return False
-      
-    
+        
         old_price = lot_fields.price
-      
         if old_price is None:
             logger.error(f"{LOGGER_PREFIX} Текущая цена лота {my_lot_id} равна None")
             return False
-      
-        logger.debug(f"{LOGGER_PREFIX} Лот {my_lot_id}: текущая цена {old_price:.2f}, новая {new_price:.2f}")
-      
-    
+        
+        # Проверяем необходимость обновления
         if abs(round(new_price, 2) - round(old_price, 2)) >= 0.005:
             lot_fields.price = new_price
-          
-        
+            
             if hasattr(cardinal.account, 'save_lot'):
                 cardinal.account.save_lot(lot_fields)
                 logger.info(f"{LOGGER_PREFIX} Лот {my_lot_id} обновлён: {old_price:.2f} → {new_price:.2f}")
-              
-            
+                
                 if my_lot_id in LOTS:
                     LOTS[my_lot_id]["last_price"] = new_price
                     LOTS[my_lot_id]["last_update"] = time.time()
-              
+                
                 return True
             else:
                 logger.error(f"{LOGGER_PREFIX} Метод save_lot недоступен")
@@ -907,231 +654,74 @@ def change_price(cardinal: Cardinal, my_lot_id: str, new_price: float) -> bool:
         else:
             logger.info(f"{LOGGER_PREFIX} Лот {my_lot_id} остался на {old_price:.2f}")
             return True
-          
+            
     except Exception as e:
         logger.error(f"{LOGGER_PREFIX} Ошибка изменения цены лота {my_lot_id}: {e}")
         return False
 
-def init(cardinal: Cardinal):
-
-    global CARDINAL_INSTANCE
+def init(cardinal):
+    global CARDINAL_INSTANCE, LOTS, SETTINGS, WIZARD_STATES
     CARDINAL_INSTANCE = cardinal
-  
-
+    
+    # Регистрируем очистку ресурсов
     atexit.register(cleanup_resources)
-  
+    
     if not cardinal.telegram:
-        logger.warning(f"{LOGGER_PREFIX} Telegram бот не включен в FunPayCardinal. Плагин Steam Price Updater не будет работать.")
+        logger.warning(f"{LOGGER_PREFIX} Telegram бот не включен. Плагин не будет работать.")
         return
 
     tg = cardinal.telegram
     bot = tg.bot
-
     logger.info(f"{LOGGER_PREFIX} Инициализация Telegram хэндлеров...")
 
+    # Упрощенные функции сохранения/загрузки
     def save_settings():
-        try:
-        
-            import os
-            os.makedirs("storage/plugins", exist_ok=True)
-          
-            with open("storage/plugins/steam_price_updater.json", "w", encoding="utf-8") as f:
-                f.write(json.dumps(SETTINGS, indent=4, ensure_ascii=False))
-            logger.info(f"{LOGGER_PREFIX} Настройки сохранены.")
-        except Exception as e:
-            logger.error(f"{LOGGER_PREFIX} Ошибка сохранения настроек: {e}")
+        save_to_file(SETTINGS, "steam_price_updater.json", "настройки")
 
     def save_lots():
-        try:
-            import os
-          
-            logger.info(f"{LOGGER_PREFIX} Начинаем сохранение лотов. Всего: {len(LOTS)}")
-          
-        
-            target_file = None
-            json_data = json.dumps(LOTS, indent=4, ensure_ascii=False)
-            logger.info(f"{LOGGER_PREFIX} Данные сериализованы. Размер: {len(json_data)} символов")
-          
-        
-            save_attempts = [
-                ("storage/plugins/steam_price_updater_lots.json", "основное расположение"),
-                ("steam_price_updater_lots.json", "текущая директория"),
-                ("/tmp/steam_price_updater_lots.json", "временная директория"),
-                ("./lots_backup.json", "резервная копия")
-            ]
-          
-            saved = False
-            for attempt_file, description in save_attempts:
-                try:
-                
-                    if "/" in attempt_file:
-                        dir_path = os.path.dirname(attempt_file)
-                        if dir_path and not os.path.exists(dir_path):
-                            os.makedirs(dir_path, exist_ok=True)
-                  
-                
-                    with open(attempt_file, "w", encoding="utf-8") as f:
-                        f.write(json_data)
-                        f.flush()
-                        try:
-                            os.fsync(f.fileno())
-                        except (OSError, AttributeError):
-                            pass
-                  
-                
-                    if os.path.exists(attempt_file):
-                        file_size = os.path.getsize(attempt_file)
-                        logger.info(f"{LOGGER_PREFIX} ✅ Лоты сохранены в {attempt_file} ({description}, размер: {file_size} байт)")
-                        target_file = attempt_file
-                        saved = True
-                        break
-                  
-                except (PermissionError, OSError, IOError) as e:
-                    logger.warning(f"{LOGGER_PREFIX} Не удалось сохранить в {attempt_file} ({description}): {e}")
-                    continue
-          
-            if not saved:
-                logger.error(f"{LOGGER_PREFIX} ❌ Не удалось сохранить лоты ни в одно расположение!")
-            
-                try:
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp_file:
-                        tmp_file.write(json_data)
-                        logger.warning(f"{LOGGER_PREFIX} Экстренное сохранение в {tmp_file.name}")
-                        target_file = tmp_file.name
-                        saved = True
-                except Exception as tmp_e:
-                    logger.error(f"{LOGGER_PREFIX} Даже экстренное сохранение не удалось: {tmp_e}")
-          
-        
-            if os.path.os.path.exists(target_file):
-                file_size = os.path.getsize(target_file)
-                logger.info(f"{LOGGER_PREFIX} ✅ Лоты сохранены в {target_file} (размер: {file_size} байт)")
-            else:
-                logger.error(f"{LOGGER_PREFIX} ❌ Файл не создался: {target_file}")
-              
-        except Exception as e:
-            logger.error(f"{LOGGER_PREFIX} ❌ Критическая ошибка сохранения лотов: {e}")
-            logger.error(f"{LOGGER_PREFIX} Тип ошибки: {type(e).__name__}")
-            import traceback
-            logger.error(f"{LOGGER_PREFIX} Трассировка: {traceback.format_exc()}")
-          
-        
-            try:
-                logger.info(f"{LOGGER_PREFIX} Лоты остаются в памяти: {len(LOTS)} лотов")
-                for lot_id, lot_data in LOTS.items():
-                    logger.info(f"{LOGGER_PREFIX} - Лот {lot_id}: {lot_data.get('steam_id', 'N/A')}")
-            except:
-                logger.error(f"{LOGGER_PREFIX} Не удается получить информацию о лотах в памяти")
+        save_to_file(LOTS, "steam_price_updater_lots.json", "лоты")
 
     def save_wizard_states():
-        """Сохраняет состояния мастера в файл"""
-        try:
-            import os
-          
-            target_file = None
-            try:
-                os.makedirs("storage/plugins", exist_ok=True)
-                target_file = "storage/plugins/steam_price_updater_wizard.json"
-            except (PermissionError, OSError):
-                target_file = "steam_price_updater_wizard.json"
-          
-            with open(target_file, "w", encoding="utf-8") as f:
-                f.write(json.dumps(WIZARD_STATES, indent=4, ensure_ascii=False))
-                f.flush()
-          
-            logger.debug(f"{LOGGER_PREFIX} Состояния мастера сохранены: {len(WIZARD_STATES)} состояний")
-        except Exception as e:
-            logger.warning(f"{LOGGER_PREFIX} Ошибка сохранения состояний мастера: {e}")
+        save_to_file(WIZARD_STATES, "steam_price_updater_wizard.json", "состояния мастера")
 
     def load_wizard_states():
-        """Загружает состояния мастера из файла"""
         global WIZARD_STATES
-        try:
-            wizard_file = None
-            if os.path.exists("storage/plugins/steam_price_updater_wizard.json"):
-                wizard_file = "storage/plugins/steam_price_updater_wizard.json"
-            elif os.path.exists("steam_price_updater_wizard.json"):
-                wizard_file = "steam_price_updater_wizard.json"
-          
-            if wizard_file:
-                with open(wizard_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    if content.strip():
-                        WIZARD_STATES = json.loads(content)
-                        logger.info(f"{LOGGER_PREFIX} Загружены состояния мастера: {len(WIZARD_STATES)} состояний")
-        except Exception as e:
-            logger.warning(f"{LOGGER_PREFIX} Ошибка загрузки состояний мастера: {e}")
-            WIZARD_STATES = {}
+        WIZARD_STATES = load_from_file("steam_price_updater_wizard.json", {})
 
-
+    # Загружаем данные
     load_wizard_states()
+    SETTINGS.update(load_from_file("steam_price_updater.json", {}))
+    
+    # Загружаем и нормализуем лоты
+    loaded_lots = load_from_file("steam_price_updater_lots.json", {})
+    if loaded_lots:
+        LOTS = loaded_lots
+        
+        # Нормализуем данные лотов
+        for lot_id, lot_data in LOTS.items():
+            # Приводим к единому формату
+            if "steam_id" not in lot_data and "steam_app_id" in lot_data:
+                LOTS[lot_id]["steam_id"] = str(lot_data["steam_app_id"])
+            
+            # Заполняем недостающие поля значениями по умолчанию
+            defaults = {
+                "steam_app_id": 0,
+                "steam_id": "730",
+                "min": SETTINGS["min_price"],
+                "max": SETTINGS["max_price"],
+                "last_steam_price": 0,
+                "last_price": 0,
+                "last_update": 0,
+                "steam_currency": "UAH"
+            }
+            
+            for key, default_value in defaults.items():
+                if key not in lot_data:
+                    LOTS[lot_id][key] = default_value
+        
+        save_lots()  # Сохраняем нормализованные данные
 
 
-    if os.path.os.path.exists("storage/plugins/steam_price_updater.json"):
-        try:
-            with open("storage/plugins/steam_price_updater.json", "r", encoding="utf-8") as f:
-                content = f.read()
-                if content.strip():
-                    loaded_settings = json.loads(content)
-                    SETTINGS.update(loaded_settings)
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"{LOGGER_PREFIX} Ошибка при чтении настроек: {e}. Использую настройки по умолчанию.")
-
-
-    load_attempts = [
-        ("storage/plugins/steam_price_updater_lots.json", "основное расположение"),
-        ("steam_price_updater_lots.json", "текущая директория"),
-        ("/tmp/steam_price_updater_lots.json", "временная директория"),
-        ("./lots_backup.json", "резервная копия")
-    ]
-  
-    lots_file = None
-    for attempt_file, description in load_attempts:
-        if os.path.exists(attempt_file):
-            lots_file = attempt_file
-            logger.info(f"{LOGGER_PREFIX} Найден файл лотов: {lots_file} ({description})")
-            break
-  
-    if lots_file:
-        try:
-            with open(lots_file, "r", encoding="utf-8") as f:
-                content = f.read()
-                global LOTS
-                if content.strip():
-                    LOTS = json.loads(content)
-                
-                    for lot_id, lot_data in LOTS.items():
-                    
-                        if "steam_id" not in lot_data and "steam_app_id" in lot_data:
-                            LOTS[lot_id]["steam_id"] = str(lot_data["steam_app_id"])
-                      
-                        if "steam_app_id" not in lot_data:
-                            LOTS[lot_id]["steam_app_id"] = 0
-                          
-                        if "steam_id" not in lot_data:
-                            LOTS[lot_id]["steam_id"] = "730"
-                          
-                        if "interval" not in lot_data or lot_data["interval"] < 3600:
-                            LOTS[lot_id]["interval"] = 21600
-                        if "min" not in lot_data:
-                            LOTS[lot_id]["min"] = SETTINGS["min_price"]
-                        if "max" not in lot_data:
-                            LOTS[lot_id]["max"] = SETTINGS["max_price"]
-                        if "last_steam_price" not in lot_data:
-                            LOTS[lot_id]["last_steam_price"] = 0
-                        if "last_price" not in lot_data:
-                            LOTS[lot_id]["last_price"] = 0
-                        if "last_update" not in lot_data:
-                            LOTS[lot_id]["last_update"] = 0
-                        if "steam_currency" not in lot_data:
-                            LOTS[lot_id]["steam_currency"] = "UAH"
-                    save_lots()
-                else:
-                    LOTS = {}
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"{LOGGER_PREFIX} Ошибка при чтении лотов: {e}. Инициализирую настройки лотов по умолчанию.")
-            LOTS = {}
 
 
 
@@ -1765,7 +1355,7 @@ def init(cardinal: Cardinal):
           
             active_lots = [lot for lot in LOTS.values() if lot.get("on", False)]
             lots_with_prices = len([l for l in LOTS.values() if l.get("last_price", 0) > 0])
-            cache_hits = len(steam_price_cache)
+            cache_hits = len(CACHE.cache)
           
             text = f"📊 Статистика Steam Price Updater\n\n"
             text += f"📦 Всего лотов: {len(LOTS)}\n"
@@ -2059,7 +1649,7 @@ def init(cardinal: Cardinal):
             def refresh_thread():
                 try:
                 
-                    global CACHE, usd_rate_cache
+                    global CACHE
                   
                 
                     cleared_count = clear_currency_cache()
@@ -2774,64 +2364,26 @@ def post_start(cardinal):
                     logger.info(f"{LOGGER_PREFIX} Обрабатываю добавленный лот {lot_id}")
                   
                     try:
-                    
-                    
-                        steam_id = lot_data.get("steam_id")
-                        if not steam_id:
-                          
-                            steam_app_id = lot_data.get("steam_app_id")
-                            if steam_app_id:
-                                steam_id = str(steam_app_id)
-                      
-                        steam_currency = lot_data.get("steam_currency", "UAH")
-                      
-                        if not steam_id:
-                            logger.info(f"{LOGGER_PREFIX} Нет Steam ID для лота {lot_id}")
-                            continue
-                      
-                    
-                        logger.debug(f"{LOGGER_PREFIX} Получаю цену Steam для {steam_id} в валюте {steam_currency}")
-                        steam_price = get_steam_price(steam_id, steam_currency)
-                      
-                        if steam_price is None or steam_price == 0:
-                            logger.warning(f"{LOGGER_PREFIX} ОШИБКА 1: Нет цены Steam для лота {lot_id} (steam_id: {steam_id}, валюта: {steam_currency})")
-                            continue
-                      
-                    
-                        logger.debug(f"{LOGGER_PREFIX} Вычисляю цену для лота {lot_id}: steam_price={steam_price}, steam_currency={steam_currency}")
-                        new_price = calculate_lot_price(steam_price, steam_currency)
-                      
-                        if new_price <= 0:
-                            logger.error(f"{LOGGER_PREFIX} ОШИБКА 2: Неверная цена для лота {lot_id}: {new_price} (steam_price: {steam_price}, steam_currency: {steam_currency})")
-                            continue
-                      
-                    
-                        lot_min = lot_data.get("min", SETTINGS["min_price"])
-                        lot_max = lot_data.get("max", SETTINGS["max_price"])
-                        new_price = max(lot_min, min(new_price, lot_max))
-                      
-                    
-                        LOTS[lot_id]["last_steam_price"] = steam_price
-                      
-                    
-                        change_price(CARDINAL_INSTANCE, lot_id, new_price)
-                      
-                        time.sleep(2)
+                        # Используем единую функцию обновления
+                        success = update_lot_price(lot_id, lot_data, CARDINAL_INSTANCE)
+                        if success:
+                            logger.debug(f"{LOGGER_PREFIX} Лот {lot_id} успешно обновлен")
+                        
+                        time.sleep(Config.LOT_PROCESSING_DELAY)
                   
                     except Exception as e:
                         logger.warning(f"{LOGGER_PREFIX} Ошибка с лотом {lot_id}: {e}")
               
             
                 if any_lot_processed:
-                    with open("storage/plugins/steam_price_updater_lots.json", "w", encoding="utf-8") as f:
-                        f.write(json.dumps(LOTS, indent=4, ensure_ascii=False))
+                    save_to_file(LOTS, "steam_price_updater_lots.json", "список лотов")
                     logger.info(f"{LOGGER_PREFIX} Цикл обработки завершен")
           
             except Exception as e:
                 logger.error(f"{LOGGER_PREFIX} Критическая ошибка в процессе: {e}")
           
         
-            time.sleep(300)
+            time.sleep(Config.CYCLE_PAUSE)
   
 
     if not hasattr(cardinal, '_steam_updater_thread_running') or not cardinal._steam_updater_thread_running:
