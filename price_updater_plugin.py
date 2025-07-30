@@ -90,19 +90,7 @@ class ThreadSafeCacheManager:
                         pass
             return None
   
-    def get_with_timestamp(self, key: str):
-        """Возвращает полный объект кеша с timestamp"""
-        with self._lock:
-            if key in self.cache:
-                entry = self.cache[key]
-                if time.time() - entry["timestamp"] < self.ttl:
-                    return entry["value"]
-                else:
-                    try:
-                        del self.cache[key]
-                    except KeyError:
-                        pass
-            return None
+
   
     def set(self, key: str, value):
         """Устанавливает значение в кеш"""
@@ -167,12 +155,7 @@ class ThreadSafeCacheManager:
                 except KeyError:
                     pass
 
-steam_price_cache = {}
-usd_rate_cache = {"rate": 0.0, "timestamp": 0.0, "cache_duration": float(Config.CACHE_TTL)}
 CACHE = ThreadSafeCacheManager()
-
-steam_price_cache_lock = Lock()
-usd_rate_cache_lock = Lock()
 
 CBT_CHANGE_CURRENCY = "SPU_change_curr"
 CBT_TEXT_CHANGE_LOT = "SPU_ChangeLot"
@@ -199,14 +182,9 @@ def get_currency_rate(currency: str = "USD") -> float:
 
     cache_key = f"{currency}_rate"
     cached_rate = CACHE.get(cache_key)
-    if cached_rate and isinstance(cached_rate, dict):
-    
-        cache_age = time.time() - cached_rate.get("timestamp", 0)
-        if cache_age < 900:
-            logger.debug(f"{LOGGER_PREFIX} Использую кеш для USD/{currency}: {cached_rate.get('rate')} (возраст: {int(cache_age/60)} мин)")
-            return cached_rate.get("rate", get_fallback_rate(currency))
-        else:
-            logger.debug(f"{LOGGER_PREFIX} Кеш USD/{currency} устарел ({int(cache_age/60)} мин), обновляю")
+    if cached_rate:
+        logger.debug(f"{LOGGER_PREFIX} Использую кеш для USD/{currency}: {cached_rate}")
+        return cached_rate
   
     try:
     
@@ -222,11 +200,7 @@ def get_currency_rate(currency: str = "USD") -> float:
                 rate = float(rates[currency])
               
             
-                CACHE.set(cache_key, {
-                    "rate": rate,
-                    "timestamp": time.time(),
-                    "source": "exchangerate-api"
-                })
+                CACHE.set(cache_key, rate)
               
                 logger.info(f"{LOGGER_PREFIX} Получен СВЕЖИЙ курс USD/{currency}: {rate} (exchangerate-api)")
                 return rate
@@ -244,32 +218,8 @@ def get_currency_rate(currency: str = "USD") -> float:
         return get_currency_fallback(currency)
 
 def get_usd_to_uah_rate() -> float:
-    """Получает курс USD к UAH из НБУ"""
-    with usd_rate_cache_lock:
-        current_time = time.time()
-      
-    
-        if (current_time - usd_rate_cache["timestamp"] < usd_rate_cache["cache_duration"] 
-            and usd_rate_cache["rate"] > 0):
-            return usd_rate_cache["rate"]
-      
-        try:
-        
-            nbu_url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=USD&json"
-            response = requests.get(nbu_url, timeout=SETTINGS["request_timeout"])
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, list) and len(data) > 0:
-                    rate = float(data[0]["rate"])
-                    usd_rate_cache["rate"] = float(rate)
-                    usd_rate_cache["timestamp"] = float(current_time)
-                    logger.info(f"{LOGGER_PREFIX} Получен курс USD/UAH: {rate} (НБУ)")
-                    return rate
-        except Exception as e:
-            logger.warning(f"{LOGGER_PREFIX} Ошибка НБУ API: {e}")
-      
-      
-        return usd_rate_cache.get("rate", 41.5)
+    """Получает курс USD к UAH из НБУ (теперь использует общий кеш)"""
+    return get_currency_rate("UAH")
 
 def get_currency_fallback(currency: str) -> float:
     """Fallback API для получения курсов валют"""
@@ -283,7 +233,7 @@ def get_currency_fallback(currency: str) -> float:
                 usd_data = cbr_data.get("Valute", {}).get("USD", {})
                 if usd_data:
                     rate = float(usd_data["Value"])
-                    CACHE.set(f"{currency}_rate", {"rate": rate, "timestamp": time.time()})
+                    CACHE.set(f"{currency}_rate", rate)
                     logger.info(f"{LOGGER_PREFIX} Получен курс USD/RUB: {rate} (ЦБ РФ)")
                     return rate
       
@@ -306,7 +256,7 @@ def get_currency_fallback(currency: str) -> float:
                             rate_match = re.search(r'(\d+\.?\d*)', rate_text)
                             if rate_match:
                                 rate = float(rate_match.group(1))
-                                CACHE.set(f"{currency}_rate", {"rate": rate, "timestamp": time.time()})
+                                CACHE.set(f"{currency}_rate", rate)
                                 logger.info(f"{LOGGER_PREFIX} Получен курс USD/KZT: {rate} (Нацбанк КЗ)")
                                 return rate
             except Exception as e:
@@ -323,7 +273,7 @@ def get_currency_fallback(currency: str) -> float:
                         eur_to_usd = data["rates"]["EUR"]
                     
                         rate = 1.0 / eur_to_usd
-                        CACHE.set(f"{currency}_rate", {"rate": rate, "timestamp": time.time()})
+                        CACHE.set(f"{currency}_rate", rate)
                         logger.info(f"{LOGGER_PREFIX} Получен курс USD/EUR: {rate} (ECB)")
                         return rate
             except Exception as e:
@@ -339,14 +289,11 @@ def get_fallback_rate(currency: str) -> float:
     """Возвращает последние известные курсы из кеша или актуальные fallback курсы"""
 
     cache_key = f"{currency}_rate"
-    cached_rate = CACHE.get_with_timestamp(cache_key)
+    cached_rate = CACHE.get(cache_key)
   
-    if cached_rate and isinstance(cached_rate, dict):
-        rate = cached_rate.get("rate")
-        if rate and rate > 0:
-            cache_age = time.time() - cached_rate.get("timestamp", 0)
-            logger.warning(f"{LOGGER_PREFIX} Используем последний известный курс USD/{currency}: {rate} (возраст: {int(cache_age/3600)}ч {int((cache_age%3600)/60)}м)")
-            return rate
+    if cached_rate and cached_rate > 0:
+        logger.warning(f"{LOGGER_PREFIX} Используем последний известный курс USD/{currency}: {cached_rate}")
+        return cached_rate
   
 
     fallback_rates = {
@@ -433,12 +380,10 @@ def get_steam_price(steam_id: str, currency_code: str = "UAH") -> Optional[float
   
 
     cache_key = f"steam_price_{steam_id}_{currency_code}"
-    with steam_price_cache_lock:
-        if cache_key in steam_price_cache:
-            cached_data = steam_price_cache[cache_key]
-            if time.time() - cached_data["timestamp"] < 3600:
-                logger.debug(f"{LOGGER_PREFIX} Кешированная цена для Steam {steam_id} ({currency_code})")
-                return cached_data["price"]
+    cached_data = CACHE.get(cache_key)
+    if cached_data:
+        logger.debug(f"{LOGGER_PREFIX} Кешированная цена для Steam {steam_id} ({currency_code})")
+        return cached_data
   
     try:
         time.sleep(SETTINGS["steam_request_delay"])
@@ -463,17 +408,12 @@ def get_steam_price(steam_id: str, currency_code: str = "UAH") -> Optional[float
                             price_value = final_price / 100.0
                           
                         
-                            with steam_price_cache_lock:
-                                steam_price_cache[cache_key] = {
-                                    "price": price_value,
-                                    "timestamp": time.time()
-                                }
+                            CACHE.set(cache_key, price_value)
                             logger.debug(f"{LOGGER_PREFIX} Steam цена для Sub ID {steam_id}: {price_value} {currency_code}")
                             return price_value
                     else:
                     
-                        with steam_price_cache_lock:
-                            steam_price_cache[cache_key] = {"price": 0.0, "timestamp": time.time()}
+                        CACHE.set(cache_key, 0.0)
                         return 0.0
         else:
         
@@ -494,17 +434,12 @@ def get_steam_price(steam_id: str, currency_code: str = "UAH") -> Optional[float
                             price_value = final_price / 100.0
                           
                         
-                            with steam_price_cache_lock:
-                                steam_price_cache[cache_key] = {
-                                    "price": price_value,
-                                    "timestamp": time.time()
-                                }
+                            CACHE.set(cache_key, price_value)
                             logger.debug(f"{LOGGER_PREFIX} Steam цена для App ID {steam_id}: {price_value} {currency_code}")
                             return price_value
                     else:
                     
-                        with steam_price_cache_lock:
-                            steam_price_cache[cache_key] = {"price": 0.0, "timestamp": time.time()}
+                        CACHE.set(cache_key, 0.0)
                         return 0.0
       
         return None
@@ -1004,7 +939,7 @@ def init(cardinal: Cardinal):
                     logger.error(f"{LOGGER_PREFIX} Даже экстренное сохранение не удалось: {tmp_e}")
           
         
-            if os.path.os.path.exists(target_file):
+            if target_file and os.path.exists(target_file):
                 file_size = os.path.getsize(target_file)
                 logger.info(f"{LOGGER_PREFIX} ✅ Лоты сохранены в {target_file} (размер: {file_size} байт)")
             else:
@@ -1068,7 +1003,7 @@ def init(cardinal: Cardinal):
     load_wizard_states()
 
 
-    if os.path.os.path.exists("storage/plugins/steam_price_updater.json"):
+    if os.path.exists("storage/plugins/steam_price_updater.json"):
         try:
             with open("storage/plugins/steam_price_updater.json", "r", encoding="utf-8") as f:
                 content = f.read()
@@ -1765,7 +1700,7 @@ def init(cardinal: Cardinal):
           
             active_lots = [lot for lot in LOTS.values() if lot.get("on", False)]
             lots_with_prices = len([l for l in LOTS.values() if l.get("last_price", 0) > 0])
-            cache_hits = len(steam_price_cache)
+            cache_hits = len(CACHE)
           
             text = f"📊 Статистика Steam Price Updater\n\n"
             text += f"📦 Всего лотов: {len(LOTS)}\n"
@@ -1778,13 +1713,13 @@ def init(cardinal: Cardinal):
                 uah_rate = get_currency_rate("UAH")
                 text += f"💱 USD/UAH: {uah_rate:.2f}\n"
               
-                rub_cached = CACHE.get("currency_rate_RUB")
-                kzt_cached = CACHE.get("currency_rate_KZT")
+                rub_cached = CACHE.get("RUB_rate")
+                kzt_cached = CACHE.get("KZT_rate")
               
                 if rub_cached:
-                    text += f"💱 USD/RUB: {rub_cached['rate']:.2f}\n"
+                    text += f"💱 USD/RUB: {rub_cached:.2f}\n"
                 if kzt_cached:
-                    text += f"💱 USD/KZT: {kzt_cached['rate']:.2f}\n"
+                    text += f"💱 USD/KZT: {kzt_cached:.2f}\n"
             except:
                 text += f"💱 Курсы валют: загрузка...\n"
           
@@ -2059,21 +1994,10 @@ def init(cardinal: Cardinal):
             def refresh_thread():
                 try:
                 
-                    global CACHE, usd_rate_cache
+                    global CACHE
                   
                 
                     cleared_count = clear_currency_cache()
-                  
-                
-                    try:
-                        currency_keys = [k for k in CACHE.keys() if k.startswith("currency_rate_")]
-                        for key in currency_keys:
-                            if key in CACHE.cache:
-                                del CACHE.cache[key]
-                    except Exception:
-                        pass
-                  
-                    usd_rate_cache["timestamp"] = 0
                   
                 
                     uah_rate = get_currency_rate("UAH")
@@ -2750,11 +2674,18 @@ def post_start(cardinal):
         lot_last_check = {}
       
         logger.info(f"{LOGGER_PREFIX} Запущен основной цикл обработки добавленных лотов")
+        logger.info(f"{LOGGER_PREFIX} Интервал проверки: {SETTINGS['time']//3600} часов ({SETTINGS['time']} секунд)")
       
         while True:
             try:
                 current_time = time.time()
                 any_lot_processed = False
+                active_lots_count = len([l for l in LOTS.values() if l.get("on", False)])
+                
+                if active_lots_count == 0:
+                    logger.debug(f"{LOGGER_PREFIX} Нет активных лотов для обработки")
+                else:
+                    logger.debug(f"{LOGGER_PREFIX} Проверяю {active_lots_count} активных лотов")
               
             
                 for lot_id, lot_data in LOTS.items():
@@ -2764,14 +2695,16 @@ def post_start(cardinal):
                 
                     global_interval = SETTINGS["time"]
                     last_check = lot_last_check.get(lot_id, 0)
-                    if current_time - last_check < global_interval:
+                    time_since_check = current_time - last_check
+                    if time_since_check < global_interval:
+                        logger.debug(f"{LOGGER_PREFIX} Лот {lot_id}: пропуск, прошло {int(time_since_check/60)} мин из {global_interval//60} мин")
                         continue
                   
                 
                     lot_last_check[lot_id] = current_time
                     any_lot_processed = True
                   
-                    logger.info(f"{LOGGER_PREFIX} Обрабатываю добавленный лот {lot_id}")
+                    logger.info(f"{LOGGER_PREFIX} Обрабатываю добавленный лот {lot_id} (прошло {int(time_since_check/60)} мин)")
                   
                     try:
                     
@@ -2823,9 +2756,14 @@ def post_start(cardinal):
               
             
                 if any_lot_processed:
-                    with open("storage/plugins/steam_price_updater_lots.json", "w", encoding="utf-8") as f:
-                        f.write(json.dumps(LOTS, indent=4, ensure_ascii=False))
-                    logger.info(f"{LOGGER_PREFIX} Цикл обработки завершен")
+                    try:
+                        import os
+                        os.makedirs("storage/plugins", exist_ok=True)
+                        with open("storage/plugins/steam_price_updater_lots.json", "w", encoding="utf-8") as f:
+                            f.write(json.dumps(LOTS, indent=4, ensure_ascii=False))
+                        logger.info(f"{LOGGER_PREFIX} Цикл обработки завершен, лоты сохранены")
+                    except Exception as save_error:
+                        logger.error(f"{LOGGER_PREFIX} Ошибка сохранения лотов в основном цикле: {save_error}")
           
             except Exception as e:
                 logger.error(f"{LOGGER_PREFIX} Критическая ошибка в процессе: {e}")
