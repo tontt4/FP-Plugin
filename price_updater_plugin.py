@@ -1060,14 +1060,15 @@ def init(cardinal):
             keyboard.add(B("◀ Отмена", callback_data=f"{CBT_LOTS_MENU}:0"))
           
         
-            user_key = f"{call.message.chat.id}_{call.from_user.id}"
-            WIZARD_STATES[user_key] = {"step": "lot_id"}
-          
-        
-            logger.info(f"{LOGGER_PREFIX} === МАСТЕР ЗАПУЩЕН ===")
-            logger.info(f"{LOGGER_PREFIX} User key: {user_key}")
-            logger.info(f"{LOGGER_PREFIX} Состояние: {WIZARD_STATES[user_key]}")
-            logger.info(f"{LOGGER_PREFIX} Все состояния: {WIZARD_STATES}")
+                    user_key = f"{call.message.chat.id}_{call.from_user.id}"
+        WIZARD_STATES[user_key] = {"step": "lot_id"}
+        save_wizard_states()
+      
+    
+        logger.info(f"{LOGGER_PREFIX} === МАСТЕР ЗАПУЩЕН ===")
+        logger.info(f"{LOGGER_PREFIX} User key: {user_key}")
+        logger.info(f"{LOGGER_PREFIX} Состояние: {WIZARD_STATES[user_key]}")
+        logger.info(f"{LOGGER_PREFIX} Все состояния: {WIZARD_STATES}")
             logger.info(f"{LOGGER_PREFIX} Chat ID: {call.message.chat.id}, User ID: {call.from_user.id}")
           
             bot.edit_message_text(text, call.message.chat.id, call.message.id,
@@ -2082,13 +2083,14 @@ def init(cardinal):
                 return
               
         
-            WIZARD_STATES[user_key] = {
-                "step": "max_price",
-                "lot_id": lot_id,
-                "steam_id": steam_id,
-                "steam_currency": currency,
-                "min_price": min_price
-            }
+        WIZARD_STATES[user_key] = {
+            "step": "max_price",
+            "lot_id": lot_id,
+            "steam_id": steam_id,
+            "steam_currency": currency,
+            "min_price": min_price
+        }
+        save_wizard_states()
           
             text = "🧙‍♂️ <b>Мастер добавления лота</b>\n\n"
             text += "📋 <b>Шаг 4 из 4: Максимальная цена</b>\n\n"
@@ -2108,11 +2110,8 @@ def init(cardinal):
             logger.error(f"{LOGGER_PREFIX} Ошибка в wizard_currency_selected: {e}")
             bot.answer_callback_query(call.id, "❌ Ошибка")
   
-    tg.cbq_handler(wizard_currency_selected, lambda c: c.data and c.data.startswith("wizard_currency:"))
-  
+        tg.cbq_handler(wizard_currency_selected, lambda c: c.data and c.data.startswith("wizard_currency:"))
 
-    WIZARD_STATES = {}
-  
     def wizard_message_handler(message: telebot.types.Message):
         """Обработчик сообщений для мастера с собственным хранением состояний"""
         global WIZARD_STATES
@@ -2180,12 +2179,13 @@ def init(cardinal):
                     bot.reply_to(message, f"❌ Лот {text} уже настроен")
                     return
               
-            
-                WIZARD_STATES[user_key] = {"step": "steam_id", "lot_id": text}
-              
-                text_msg = "🧙‍♂️ <b>Мастер добавления лота</b>\n\n"
-                text_msg += "📋 <b>Шаг 2 из 4: Steam ID</b>\n\n"
-                text_msg += f"✅ ID лота: <code>{text}</code>\n\n"
+        
+            WIZARD_STATES[user_key] = {"step": "steam_id", "lot_id": text}
+            save_wizard_states()
+          
+            text_msg = "🧙‍♂️ <b>Мастер добавления лота</b>\n\n"
+            text_msg += "📋 <b>Шаг 2 из 4: Steam ID</b>\n\n"
+            text_msg += f"✅ ID лота: <code>{text}</code>\n\n"
                 text_msg += "Введите Steam ID игры:\n"
                 text_msg += "• Для обычных игр: <code>730</code> (CS2)\n"
                 text_msg += "• Для DLC: <code>sub/12345</code>\n"
@@ -2237,15 +2237,16 @@ def init(cardinal):
             
                 logger.info(f"{LOGGER_PREFIX} Переходим к шагу 3: выбор валюты")
               
-            
-                original_steam_id = text
-                WIZARD_STATES[user_key] = {
-                    "step": "currency", 
-                    "lot_id": lot_id, 
-                    "steam_id": original_steam_id,
-                    "steam_id_type": id_type,
-                    "min_price": min_price
-                }
+        
+            original_steam_id = text
+            WIZARD_STATES[user_key] = {
+                "step": "currency", 
+                "lot_id": lot_id, 
+                "steam_id": original_steam_id,
+                "steam_id_type": id_type,
+                "min_price": min_price
+            }
+            save_wizard_states()
                 logger.info(f"{LOGGER_PREFIX} Обновлено состояние: {WIZARD_STATES[user_key]}")
               
                 text_msg = "🧙‍♂️ <b>Мастер добавления лота</b>\n\n"
@@ -2300,9 +2301,10 @@ def init(cardinal):
                 LOTS[lot_id] = lot_data
                 save_lots()
               
-            
-                if user_key in WIZARD_STATES:
-                    del WIZARD_STATES[user_key]
+        
+            if user_key in WIZARD_STATES:
+                del WIZARD_STATES[user_key]
+                save_wizard_states()
               
             
                 global_interval_hours = SETTINGS['time'] // 3600
